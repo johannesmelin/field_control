@@ -1,0 +1,12 @@
+[project]
+name = "field-control"
+version = "0.1.0"
+description = "Fail-closed row-navigation integration for the saffron robot"
+requires-python = ">=3.11"
+dependencies = [
+	"numpy>=1.24",
+	"opencv-python-headless>=4.8",
+]
+
+[tool.unittest]
+start-directory = "tests"
