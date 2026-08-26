@@ -16,6 +16,50 @@ class TurnPlan:
     direction: Literal["left", "right"]
 
 
+@dataclass(frozen=True)
+class DifferentialTurnPlan:
+    """Signed wheel-distance targets and motor ratios normalized from wheel turns."""
+    left_distance_m: float
+    right_distance_m: float
+    left_ratio: float
+    right_ratio: float
+    direction: Literal["left", "right"]
+
+
+def _ratios(left_wheel_turns: float, right_wheel_turns: float) -> tuple[float, float]:
+    """Normalize signed wheel turns; motor-side common 8:1 cancels out."""
+    maximum = max(abs(left_wheel_turns), abs(right_wheel_turns))
+    if maximum <= 0: raise ValueError("turn targets måste vara icke-noll")
+    return left_wheel_turns / maximum, right_wheel_turns / maximum
+
+
+def in_row_turn_plan(geometry: DriveGeometry, wheel_degrees: float = 720.0,
+                     direction: Literal["left", "right"] = "right") -> DifferentialTurnPlan:
+    """Contra-wheel in-row target inherited from OAK's 720 wheel-degree setting."""
+    geometry.validate()
+    if not math.isfinite(wheel_degrees) or wheel_degrees <= 0:
+        raise ValueError("in_row_turn_wheel_degrees måste vara positiv")
+    if direction not in ("left", "right"): raise ValueError("turn direction måste vara left eller right")
+    left = geometry.left_wheel_circumference_m * wheel_degrees / 360.0
+    right = geometry.right_wheel_circumference_m * wheel_degrees / 360.0
+    if direction == "left": left = -left
+    else: right = -right
+    left_ratio, right_ratio = _ratios(left / geometry.left_wheel_circumference_m,
+                                      right / geometry.right_wheel_circumference_m)
+    return DifferentialTurnPlan(left, right, left_ratio, right_ratio, direction)
+
+
+def new_row_turn_targets(geometry: DriveGeometry, row_spacing_m: float, speed_rpm: float,
+                         direction: Literal["left", "right"] = "right",
+                         inner_wheel_min_ratio: float = 0.0) -> DifferentialTurnPlan:
+    """Forward arc targets; ratios remain motor-side and have no gearbox scale."""
+    plan = new_row_turn_plan(geometry, row_spacing_m, speed_rpm, direction, inner_wheel_min_ratio)
+    left_ratio, right_ratio = _ratios(plan.left_distance_m / geometry.left_wheel_circumference_m,
+                                      plan.right_distance_m / geometry.right_wheel_circumference_m)
+    return DifferentialTurnPlan(plan.left_distance_m, plan.right_distance_m,
+                                left_ratio, right_ratio, direction)
+
+
 def new_row_turn_plan(
     geometry: DriveGeometry, row_spacing_m: float, speed_rpm: float,
     direction: Literal["left", "right"] = "right", inner_wheel_min_ratio: float = 0.0,

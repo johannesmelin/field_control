@@ -9,6 +9,7 @@ from .heading import signed_angle_delta
 
 @dataclass(frozen=True)
 class WheelCommand:
+    """Per-side motor RPM commands, before ``DriveGeometry`` gearbox ratio."""
     left_rpm: float
     right_rpm: float
     source: str
@@ -23,7 +24,7 @@ def _validate(base_rpm: float, kp: float, deadband: float, max_correction: float
 
 def bounded_differential(base_rpm: float, error: float, kp: float, deadband: float,
                          max_correction_rpm: float, max_rpm: float, source: str) -> WheelCommand:
-    """Apply bounded P steering without either wheel exceeding ``max_rpm``.
+    """Apply bounded P steering without either motor command exceeding ``max_rpm``.
 
     Positive error makes the left wheel faster and the right wheel slower. The
     physical motor adapter additionally clamps and signs commands at its own

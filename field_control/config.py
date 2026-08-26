@@ -6,6 +6,7 @@ independent of camera and livestream resolution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 from .state_machine import SafetyConfig
@@ -75,6 +76,43 @@ class VisionConfig:
 
 
 @dataclass(frozen=True)
+class PhysicalCanConfig:
+    """Deployment-only opt-in for a physical SocketCAN motor boundary.
+
+    The default deliberately has no channel or reply profile, so ordinary
+    application construction remains a dry-run and cannot open CAN.
+    """
+    enabled: bool = False
+    channel: str | None = None
+    reply_profile: str | None = None
+    slcan_device: str | None = None
+    confirm_physical_stop_tested: bool = False
+    confirm_wheels_raised: bool = False
+
+    def validate(self) -> "PhysicalCanConfig":
+        if not isinstance(self.enabled, bool):
+            raise ValueError("physical CAN enable måste vara boolesk")
+        if not self.enabled:
+            return self
+        if not isinstance(self.channel, str) or not self.channel.strip():
+            raise ValueError("explicit CAN-kanal krävs när fysisk output aktiveras")
+        if self.channel != "can0":
+            raise ValueError("fysisk output kräver den verifierade can0-kanalen")
+        if self.reply_profile != "observed-rmdx-same-id":
+            raise ValueError("fysisk output kräver installerad named same-ID motorsvarsprofil")
+        by_id_prefix = "/dev/serial/by-id/"
+        basename = (self.slcan_device[len(by_id_prefix):]
+                    if isinstance(self.slcan_device, str) and self.slcan_device.startswith(by_id_prefix) else "")
+        if not basename or basename in (".", "..") or "/" in basename:
+            raise ValueError("fysisk output kräver stabil /dev/serial/by-id/-sökväg")
+        if self.confirm_physical_stop_tested is not True:
+            raise ValueError("explicit bekräftelse av fysiskt STOP-test krävs")
+        if self.confirm_wheels_raised is not True:
+            raise ValueError("explicit bekräftelse att hjulen är upphissade krävs")
+        return self
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     vision: VisionConfig = VisionConfig()
     safety: SafetyConfig = SafetyConfig()
@@ -84,30 +122,37 @@ class RuntimeConfig:
     camera_timeout_s: float = .5
     imu_timeout_s: float = .5
     odometry_timeout_s: float = .5
-    control_lease_timeout_s: float = .5
+    control_lease_timeout_s: float = .3
+    watchdog_period_s: float = .02
+    max_control_stall_s: float = .12
+    physical_can: PhysicalCanConfig = PhysicalCanConfig()
     odometry_geometry: DriveGeometry = DriveGeometry()
     row_spacing_m: float = 1.2
     processing_width: int = 320
     processing_height: int = 240
     navigation_frame_rate_hz: float = 10.0
+    imu_sample_hz: int = 100
     stream_enabled: bool = True
     stream_fps: float = 5.0
     stream_width: int = 320
     stream_height: int = 240
     jpeg_quality: int = 85
+    # All speed values below are motor-side RPM before DriveGeometry's ratio.
     max_rpm: float = 0.0
+    manual_rpm: float = 0.0  # motor-side RPM; never enables physical output by itself
     auto_base_rpm: float = 0.0
     search_speed_rpm: float = 0.0
-    turn_speed_rpm: float = 0.0
+    turn_speed_rpm: float = 0.0  # motor-side RPM; turn ratios are geometry-only
     vision_kp: float = 0.0
     vision_deadband_px: float = 0.0
     max_vision_correction_rpm: float = 0.0
     heading_kp: float = 0.0
     heading_deadband_deg: float = 0.0
     max_heading_correction_rpm: float = 0.0
+    log_level: str = "INFO"
 
     def validate(self) -> "RuntimeConfig":
-        self.vision.validate(); self.safety.validate(); self.odometry_geometry.validate()
+        self.vision.validate(); self.safety.validate(); self.odometry_geometry.validate(); self.physical_can.validate()
         if not 0 < self.heading_filter_alpha <= 1:
             raise ValueError("heading_filter_alpha måste vara > 0 och <= 1")
         if self.row_heading_window_m <= 0 or self.heading_reference_min_distance_m < 0:
@@ -117,14 +162,27 @@ class RuntimeConfig:
         timeouts = (self.camera_timeout_s, self.imu_timeout_s, self.odometry_timeout_s, self.control_lease_timeout_s)
         if any(value <= 0 for value in timeouts):
             raise ValueError("sensortimeout måste vara positiv")
+        if not 0 < self.watchdog_period_s <= .020:
+            raise ValueError("watchdogperiod måste vara positiv och högst 20 ms")
+        if not 0 < self.max_control_stall_s <= .120:
+            raise ValueError("maximal styrloopstall måste vara positiv och högst 120 ms")
+        if self.control_lease_timeout_s > .300:
+            raise ValueError("control-lease-timeout får vara högst 300 ms")
         dimensions = (self.processing_width, self.processing_height, self.stream_width, self.stream_height)
         if any(value < 1 for value in dimensions) or self.jpeg_quality not in range(1, 101):
             raise ValueError("bilddimensioner och JPEG-kvalitet är ogiltiga")
         if self.navigation_frame_rate_hz <= 0 or self.stream_fps <= 0:
             raise ValueError("bildfrekvens måste vara positiv")
-        numeric = (self.max_rpm, self.auto_base_rpm, self.search_speed_rpm, self.turn_speed_rpm,
+        if isinstance(self.imu_sample_hz, bool) or not isinstance(self.imu_sample_hz, int) or self.imu_sample_hz <= 0:
+            raise ValueError("imu_sample_hz måste vara ett positivt heltal")
+        if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            raise ValueError("log_level måste vara DEBUG, INFO, WARNING, ERROR eller CRITICAL")
+        numeric = (self.max_rpm, self.manual_rpm, self.auto_base_rpm, self.search_speed_rpm, self.turn_speed_rpm,
                    self.vision_kp, self.vision_deadband_px, self.max_vision_correction_rpm,
                    self.heading_kp, self.heading_deadband_deg, self.max_heading_correction_rpm)
-        if any(value < 0 for value in numeric):
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+               for value in numeric):
             raise ValueError("styrparametrar får inte vara negativa")
+        if self.physical_can.enabled and self.max_rpm <= 0:
+            raise ValueError("max_rpm måste vara positiv när fysisk CAN-output aktiveras")
         return self

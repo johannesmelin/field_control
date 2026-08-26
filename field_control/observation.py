@@ -6,6 +6,7 @@ import math
 from typing import TYPE_CHECKING
 
 from .heading import RowHeadingReference, circular_low_pass
+from .odometry import OdometrySample
 from .sources import SourceSnapshot
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class Observation:
     camera_fresh: bool
     imu_fresh: bool
     odometry_fresh: bool
+    odometry_sample: OdometrySample | None = None
     camera_error: str | None = None
     imu_error: str | None = None
     fault: str | None = None
@@ -39,6 +41,21 @@ class Observation:
     @property
     def visual_target(self) -> bool:
         return self.vision is not None and self.vision.target_x is not None and self.camera_fresh
+
+
+def forward_distance_from_odometry(value: OdometrySample | float | int | None) -> float:
+    """Extract forward distance, accepting legacy injected numeric snapshots.
+
+    Real encoder sources publish :class:`OdometrySample`; numeric values remain
+    supported only for hardware-independent injected sources and older tests.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, OdometrySample):
+        return value.forward_distance_m
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("ogiltigt odometriavstånd")
+    return float(value)
 
 
 class HeadingProcessor:
@@ -63,7 +80,7 @@ def build_observation(
     now_s: float,
     camera: SourceSnapshot[object],
     imu: SourceSnapshot[ImuReading],
-    odometry: SourceSnapshot[float],
+    odometry: SourceSnapshot[OdometrySample | float | int],
     vision: "VisionResult | None",
     heading: HeadingProcessor,
     camera_timeout_s: float,
@@ -82,10 +99,11 @@ def build_observation(
     elif not imu_fresh: fault = "IMU_TIMEOUT"
     elif not odometry_fresh: fault = "ODOMETRY_TIMEOUT"
     elif not can_healthy: fault = "CAN_FAILURE"
+    odometry_sample = odometry.value if isinstance(odometry.value, OdometrySample) else None
     return Observation(
         now_s, vision if camera_fresh else None, heading.filtered_heading_deg,
         heading.reference.reference_deg, heading.reference.reliable,
         camera_age, imu_age, odometry_age,
-        float(odometry.value or 0.0), camera_fresh, imu_fresh, odometry_fresh,
-        camera.error, imu.error, fault,
+        forward_distance_from_odometry(odometry.value), camera_fresh, imu_fresh, odometry_fresh,
+        odometry_sample, camera.error, imu.error, fault,
     )

@@ -1,9 +1,18 @@
 import unittest
 
-from field_control.odometry import DriveGeometry, from_motor_angles
+from field_control.odometry import (DriveGeometry, from_motor_angles,
+                                    motor_rpm_to_wheel_rpm, wheel_rpm_to_motor_rpm)
 
 
 class OdometryTests(unittest.TestCase):
+    def test_motor_wheel_rpm_conversion_uses_configured_ratio(self):
+        self.assertEqual(motor_rpm_to_wheel_rpm(80, DriveGeometry(motor_turns_per_wheel_turn=8)), 10)
+        self.assertEqual(wheel_rpm_to_motor_rpm(10, DriveGeometry(motor_turns_per_wheel_turn=8)), 80)
+        self.assertEqual(motor_rpm_to_wheel_rpm(60, DriveGeometry(motor_turns_per_wheel_turn=6)), 10)
+
+    def test_motor_wheel_rpm_conversion_rejects_invalid_values_or_ratio(self):
+        with self.assertRaises(ValueError): motor_rpm_to_wheel_rpm(float("nan"), DriveGeometry())
+        with self.assertRaises(ValueError): wheel_rpm_to_motor_rpm(1, DriveGeometry(motor_turns_per_wheel_turn=0))
     def test_eight_motor_turns_is_one_wheel_turn_for_both_sides(self):
         geometry = DriveGeometry()
         sample = from_motor_angles(0, 0, 2880, -2880, geometry)

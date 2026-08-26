@@ -1231,7 +1231,7 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | Parameter                     | Förklaring                                                                                                                           |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `navigation_mode`             | Anger vilka visuella objekt som används för radföljning. Tillåtna värden minst `buds_only` och `buds_and_leaves`.                    |
-| `auto_base_rpm`               | Grundhastighet vid normal automatisk radföljning, uttryckt som rpm på hjulmotorernas utgående axel.                                  |
+| `auto_base_rpm`               | Grundhastighet vid normal automatisk radföljning, uttryckt som motor-side rpm före `motor_turns_per_wheel_turn`.                     |
 | `vision_kp`                   | P-faktor för bildbaserad styrning. Avgör hur kraftigt motorhastigheterna korrigeras utifrån `x_error`.                               |
 | `vision_deadband_px`          | Om absolutvärdet av `x_error` är mindre än detta antal pixlar görs ingen styrkorrigering.                                            |
 | `max_vision_correction_rpm`   | Maximalt tillåten differentialkorrektion i rpm från den visuella regulatorn.                                                         |
@@ -1275,6 +1275,12 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `in_row_turn_enabled`          | Anger om roboten ska köra samma fysiska rad i båda riktningarna innan den går vidare till nästa rad.                                     |
 | `new_row_turn_direction`       | Anger åt vilket håll roboten ska gå till nästa rad. Tillåtna värden `left` och `right`.                                                  |
+| `in_row_turn_wheel_degrees`    | Ärvd OAK-default `720` wheel degrees för contra-wheel in-row-turn; kräver senare HIL-kalibrering.                                      |
+| `inner_wheel_min_ratio`        | Minsta tillåtna inner/outer-wheel target-ratio för new-row-arc.                                                                         |
+| `turn_timeout_s`               | Monoton deadline för ren turn-controller.                                                                                                |
+| `turn_distance_tolerance_m`    | Tillåten signed wheel-distance-avvikelse vid turn-completion.                                                                          |
+| `turn_heading_tolerance_deg`   | Tillåten avvikelse från initial heading + 180 grader.                                                                                   |
+| `turn_heading_confirm_frames`  | Antal färska heading-bekräftelser som krävs före turn-success.                                                                         |
 | `row_spacing_m`                | CC-avstånd mellan två intilliggande saffransrader.                                                                                       |
 | `number_of_rows`               | Antal unika fysiska rader som ska bearbetas.                                                                                             |
 | `turn_speed_rpm`               | Grundhastighet under `AUTO_IN_ROW_TURN` och `AUTO_NEW_ROW_TURN`, om den verifierade turn-implementationen stödjer separat vändhastighet. |
@@ -1367,13 +1373,13 @@ Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
 
 | Parameter    | Förklaring                                                      |
 | ------------ | --------------------------------------------------------------- |
-| `manual_rpm` | Normal hjulhastighet vid manuell körning från webbgränssnittet. |
+| `manual_rpm` | Normal motor-side rpm vid manuell körning från webbgränssnittet; wheel rpm = motor rpm / `DriveGeometry.motor_turns_per_wheel_turn`. |
 
 ## 41.16 Motorbegränsningar
 
 | Parameter            | Förklaring                                                                                                                                      |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_rpm`            | Absolut maximal tillåten rpm på hjulmotorernas utgående axlar oberoende av state eller regulator.                                               |
+| `max_rpm`            | Absolut maximal tillåten motor-side rpm före `motor_turns_per_wheel_turn`; wheel rpm härleds från denna enda geometri.                         |
 | `acceleration_limit` | Maximal tillåten förändring av motorhastigheten per tidsenhet, om detta inte redan hanteras som en fast del av den verifierade motorstyrningen. |
 
 Om befintlig motorstyrning har en verifierad rampfunktion som inte behöver konfigureras ska den återanvändas i stället för att skapa ny rampfunktionalitet.

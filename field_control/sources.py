@@ -11,10 +11,18 @@ import time
 import math
 from typing import Callable, Generic, Protocol, TypeVar
 
-from .odometry import DriveGeometry, from_motor_angles
+from .odometry import DriveGeometry, OdometrySample, from_motor_angles
 
 
 ValueT = TypeVar("ValueT")
+
+
+class EncoderReadPreempted(RuntimeError):
+    """A physical encoder read lost to an intentional STOP/restart settle.
+
+    This is a transient scheduling outcome, not an encoder or CAN failure.
+    Only the shared verified-CAN adapter may raise it.
+    """
 
 
 @dataclass(frozen=True)
@@ -130,24 +138,92 @@ class ImuSource(_ThreadedSource[object]):
         super().stop()
 
 
-class OdometrySource(_ThreadedSource[float]):
-    """Latest forward distance derived from injected motor-angle readings."""
+class OdometrySource(_ThreadedSource[OdometrySample]):
+    """Latest immutable per-wheel odometry derived from motor-angle readings."""
+
+    # The verified CAN worker needs at most one shared 40 ms 0x92 reply
+    # deadline for an atomic pair.  Sampling at no more than the established
+    # 10 Hz control interval leaves a full command slot between samples and
+    # prevents sensor polling from continuously occupying the sole worker.
+    SAMPLE_PERIOD_S = 0.100
 
     def __init__(self, backend: EncoderBackend, geometry: DriveGeometry) -> None:
         self._backend = backend
         self._geometry = geometry.validate()
         self._initial: tuple[float, float] | None = None
-        super().__init__(self._read_distance, "field-odometry")
+        # Arming a physical boundary must wait for an actual encoder sample,
+        # not merely for this source thread to have been started.  This is a
+        # condition rather than a polling delay so the first publish, a read
+        # failure and stop/close all wake a blocked armer promptly.
+        self._readiness = threading.Condition()
+        super().__init__(self._read_sample, "field-odometry")
 
-    def _read_distance(self) -> float:
+    def _read_sample(self) -> OdometrySample:
         angles = self._backend.angles()
         if self._initial is None:
             self._initial = angles
-        sample = from_motor_angles(*self._initial, *angles, self._geometry)
-        return sample.forward_distance_m
+        return from_motor_angles(*self._initial, *angles, self._geometry)
+
+    def snapshot(self) -> SourceSnapshot[OdometrySample]:
+        """Return one immutable, timestamped latest sample without queueing."""
+        return self.latest.snapshot()
+
+    def _run(self) -> None:
+        """Publish at a bounded rate; never turn a latest-value source into a CAN queue."""
+        try:
+            while not self._stop.is_set():
+                self.latest.publish(self._read())
+                with self._readiness:
+                    self._readiness.notify_all()
+                self._stop.wait(self.SAMPLE_PERIOD_S)
+        except Exception as exc:
+            if not self._stop.is_set():
+                self.latest.fail(f"{type(exc).__name__}: {exc}")
+        finally:
+            with self._readiness:
+                self._readiness.notify_all()
+
+    def wait_until_ready(self, timeout_s: float) -> bool:
+        """Wait boundedly for the first valid sample or a terminal source state.
+
+        ``stop()`` wakes this wait immediately, so runtime shutdown never has
+        to wait for the acquisition timeout.  The caller deliberately owns
+        lifecycle locking; this method holds only the local condition.
+        """
+        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool)
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("odometrins readiness-timeout måste vara positiv")
+        deadline = time.monotonic() + float(timeout_s)
+        with self._readiness:
+            while True:
+                snapshot = self.snapshot()
+                if snapshot.connected and isinstance(snapshot.value, OdometrySample):
+                    return True
+                if self._stop.is_set() or snapshot.error is not None:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._readiness.wait(remaining)
 
     def stop(self) -> None:
+        self.begin_shutdown()
         super().stop()
+
+    def begin_shutdown(self) -> None:
+        """Cancel future sampling without taking ownership of the CAN sink.
+
+        This small first phase is used by the runtime before the physical
+        motor boundary claims its final STOP+close. It wakes a sampler and
+        prevents any subsequent 0x92 admission during shutdown.
+        """
+        # Wake an arming waiter before closing a possibly blocking backend.
+        self._stop.set()
+        with self._readiness:
+            self._readiness.notify_all()
+        begin_shutdown = getattr(self._backend, "begin_shutdown", None)
+        if callable(begin_shutdown):
+            begin_shutdown()
 
 
 class DepthAICameraBackend:

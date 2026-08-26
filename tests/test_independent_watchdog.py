@@ -1,0 +1,263 @@
+import threading
+import time
+import unittest
+
+from field_control.config import PhysicalCanConfig, RuntimeConfig
+from field_control.lease import ControlLease
+from field_control.runtime import CONTROL_LEASE_EXPIRED, FieldControlRuntime
+from field_control.sources import LatestValue
+from field_control.state_machine import State
+from field_control.verified_motor_boundary import _VerifiedPhysicalMotorBoundary
+from field_control.motor_boundary import MotorOutputFault
+from field_control.control import WheelCommand
+from field_control.observation import Observation as SensorObservation
+from field_control.odometry import OdometrySample
+
+
+class Source:
+    def __init__(self): self.latest = LatestValue()
+    def start(self): pass
+    def stop(self): pass
+
+
+class Sink:
+    def __init__(self):
+        self.stops = []; self.commands = []; self.callback = None; self.closed = False
+        self.drive_admitted = threading.Event()
+        self.stop_queued = threading.Event()
+        self.events = []; self.fail_settle = None
+    def set_fault_callback(self, callback): self.callback = callback
+    def command(self, left, right, reason):
+        self.commands.append((left, right, reason)); self.drive_admitted.set()
+    def stop_all(self, reason): self.stops.append(reason); self.stop_queued.set()
+    def stop_and_settle_for_restart(self):
+        self.events.append("settle")
+        if self.fail_settle is not None: raise self.fail_settle
+    def stop_and_settle_and_close(self):
+        self.events.append("shutdown-settle")
+        try:
+            if self.fail_settle is not None: raise self.fail_settle
+        finally:
+            self.close()
+    def close(self): self.closed = True; self.events.append("close")
+
+
+class BlockingRuntime(FieldControlRuntime):
+    def _run(self):
+        # Deliberately no tick/heartbeat: the independent watchdog must act.
+        self._stop.wait()
+
+
+class IndependentWatchdogTests(unittest.TestCase):
+    def make_runtime(self, *, lease_timeout=.3):
+        now = [0.0]
+        config = RuntimeConfig(
+            stream_enabled=False, max_rpm=20, auto_base_rpm=5, vision_kp=1, control_lease_timeout_s=lease_timeout,
+            watchdog_period_s=.01, max_control_stall_s=.12,
+            physical_can=PhysicalCanConfig(True, "can0", "observed-rmdx-same-id", "/dev/serial/by-id/test", True, True),
+        )
+        lease = ControlLease(lease_timeout, clock=lambda: now[0]); sink = Sink()
+        motor = _VerifiedPhysicalMotorBoundary(sink, lease, max_rpm=20)
+        runtime = BlockingRuntime(config, Source(), Source(), motor=motor, lease=lease, clock=lambda: now[0])
+        return runtime, sink, now
+
+    def test_arm_requires_running_control_and_independent_watchdog(self):
+        runtime, _sink, _now = self.make_runtime()
+        with self.assertRaises(ValueError): runtime.arm_motor_output()
+        runtime.close()
+
+    def test_stall_revokes_and_queues_stop_without_control_loop_progress(self):
+        runtime, sink, now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        now[0] = .13
+        deadline = time.monotonic() + .5
+        while runtime.machine.state is not State.FAULT and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(runtime.machine.state, State.FAULT)
+        self.assertEqual(runtime.status().fault, "CONTROL_LOOP_STALL")
+        self.assertTrue(sink.stops)
+        self.assertFalse(runtime.motor.armed)
+        runtime.tick()
+        self.assertEqual(runtime.machine.state, State.FAULT)
+        with self.assertRaises(ValueError):
+            runtime.manual_command(WheelCommand(1, 1, "after watchdog"))
+        runtime.close()
+
+    def test_close_gate_rejects_an_arm_that_finishes_after_closing_begins(self):
+        runtime, sink, _now = self.make_runtime()
+        entered = threading.Event(); release = threading.Event()
+        def settle():
+            entered.set(); release.wait(.5)
+        sink.stop_and_settle_for_restart = settle
+        runtime.start()
+        errors = []
+        arm_thread = threading.Thread(target=lambda: self._capture(runtime.arm_motor_output, errors))
+        arm_thread.start(); self.assertTrue(entered.wait(.5))
+        close_thread = threading.Thread(target=lambda: self._capture(runtime.close, errors))
+        close_thread.start(); time.sleep(.02); release.set()
+        arm_thread.join(.5); close_thread.join(.5)
+        self.assertFalse(runtime.motor.armed)
+        self.assertEqual(sink.commands, [])
+        self.assertTrue(errors)
+        with self.assertRaises(ValueError):
+            runtime.manual_command(WheelCommand(1, 1, "after close"))
+        with self.assertRaises(ValueError):
+            runtime.start_auto()
+
+    def test_close_linearization_blocks_paused_auto_dispatch_admission(self):
+        runtime, sink, _now = self.make_runtime()
+        token_seen = threading.Event(); release_dispatch = threading.Event()
+        close_entered = threading.Event(); release_close = threading.Event()
+        runtime._before_auto_command_admission = lambda: (token_seen.set(), release_dispatch.wait(.5))
+        runtime._after_closing_before_revoke = lambda: (close_entered.set(), release_close.wait(.5))
+        runtime.start(); runtime.arm_motor_output()
+        vision = type("Vision", (), {"target_x": 10.0, "overlay": type("Overlay", (), {"shape": (20, 20)})()})()
+        observation = SensorObservation(0, vision, None, None, False, 0, 0, 0, 0,
+                                        True, True, True)
+        dispatch = threading.Thread(target=lambda: runtime._dispatch_command(observation, State.AUTO_ROW_FOLLOW))
+        dispatch.start(); self.assertTrue(token_seen.wait(.5))
+        closer = threading.Thread(target=runtime.close); closer.start()
+        self.assertTrue(close_entered.wait(.5))
+        self.assertEqual(runtime._lifecycle.value, "CLOSING")
+        self.assertTrue(runtime.lease.valid(runtime._lease_token))
+        release_dispatch.set()
+        # Dispatch has the token but remains blocked on lifecycle admission.
+        self.assertFalse(sink.drive_admitted.wait(.05))
+        release_close.set(); dispatch.join(.5); closer.join(.5)
+        self.assertEqual(sink.commands, [])
+        self.assertEqual(sink.stops, [])
+
+    def test_verified_runtime_close_has_single_settle_then_close_without_stop_queue(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        sink.events.clear()
+
+        runtime.close()
+
+        self.assertEqual(sink.events, ["shutdown-settle", "close"])
+        self.assertEqual(sink.stops, [])
+        self.assertEqual(sink.commands, [])
+        self.assertFalse(runtime._thread and runtime._thread.is_alive())
+        self.assertFalse(runtime._watchdog_thread and runtime._watchdog_thread.is_alive())
+
+    def test_verified_runtime_close_settle_failure_still_closes_and_faults(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        sink.events.clear(); sink.fail_settle = RuntimeError("settle timeout")
+
+        with self.assertRaises(MotorOutputFault):
+            runtime.close()
+
+        self.assertEqual(sink.events, ["shutdown-settle", "close"])
+        self.assertEqual(sink.stops, [])
+        self.assertTrue(sink.closed)
+        self.assertIn("SHUTDOWN_STOP_FAILURE", runtime.status().fault or "")
+        self.assertFalse(runtime._thread and runtime._thread.is_alive())
+        self.assertFalse(runtime._watchdog_thread and runtime._watchdog_thread.is_alive())
+
+    def test_close_wins_over_an_already_woken_watchdog_before_revoke(self):
+        runtime, sink, now = self.make_runtime()
+        watchdog_ready = threading.Event(); release_watchdog = threading.Event()
+        close_entered = threading.Event()
+        runtime._before_watchdog_revoke = lambda: (watchdog_ready.set(), release_watchdog.wait(.5))
+        runtime._after_closing_before_revoke = close_entered.set
+        runtime.start(); runtime.arm_motor_output()
+        sink.events.clear(); now[0] = .13
+        self.assertTrue(watchdog_ready.wait(.5))
+
+        closer = threading.Thread(target=runtime.close)
+        closer.start(); self.assertTrue(close_entered.wait(.5))
+        release_watchdog.set(); closer.join(.5)
+
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(sink.stops, [])
+        self.assertEqual(sink.events, ["shutdown-settle", "close"])
+
+    def test_close_wins_over_an_inflight_sensor_fault_tick_stop(self):
+        runtime, sink, _now = self.make_runtime()
+        fault_recorded = threading.Event(); release_tick = threading.Event()
+        close_entered = threading.Event(); release_close = threading.Event()
+        runtime._before_tick_fault_stop = lambda: (fault_recorded.set(), release_tick.wait(.5))
+        runtime._after_closing_before_revoke = lambda: (close_entered.set(), release_close.wait(.5))
+        runtime.start(); runtime.arm_motor_output()
+        sink.events.clear()
+        with runtime._state_lock:
+            runtime.machine._transition(State.AUTO_ROW_FOLLOW, "test sensor fault")
+
+        tick = threading.Thread(target=runtime.tick)
+        tick.start(); self.assertTrue(fault_recorded.wait(.5))
+        self.assertIn("CAMERA_TIMEOUT", runtime.status().fault or "")
+        closer = threading.Thread(target=runtime.close)
+        closer.start(); self.assertTrue(close_entered.wait(.5))
+        release_tick.set()
+        # Tick is now blocked at its lifecycle-gated output action; close owns
+        # the adapter and no best-effort STOP can be queued.
+        self.assertFalse(sink.stop_queued.wait(.05))
+        release_close.set(); tick.join(.5); closer.join(.5)
+
+        self.assertFalse(tick.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(sink.stops, [])
+        self.assertEqual(sink.events, ["shutdown-settle", "close"])
+
+    @staticmethod
+    def _capture(operation, errors):
+        try: operation()
+        except Exception as exc: errors.append(exc)
+
+    def test_lease_expiry_stops_without_any_control_tick(self):
+        runtime, sink, now = self.make_runtime(lease_timeout=.1)
+        runtime.start(); runtime.arm_motor_output()
+        now[0] = .11
+        deadline = time.monotonic() + .5
+        while runtime.machine.state is not State.FAULT and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(runtime.status().fault, "CONTROL_LEASE_EXPIRED")
+        self.assertTrue(sink.stops)
+        runtime.close()
+
+    def test_previously_fresh_physical_odometry_times_out_in_manual_without_a_command(self):
+        """The independent watchdog owns a shared encoder deadline in MANUAL.
+
+        There is no subsequent manual request here to discover the stale
+        sample, and the lease remains valid longer than the odometry timeout.
+        """
+        now = [0.0]
+
+        class Odometry:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): self.latest.publish(OdometrySample(0, 0, 0, 0), now[0])
+            def stop(self): pass
+            def snapshot(self): return self.latest.snapshot()
+
+        config = RuntimeConfig(
+            stream_enabled=False, max_rpm=20, auto_base_rpm=5, vision_kp=1,
+            odometry_timeout_s=.1, control_lease_timeout_s=.3,
+            watchdog_period_s=.01, max_control_stall_s=.12,
+            physical_can=PhysicalCanConfig(True, "can0", "observed-rmdx-same-id", "/dev/serial/by-id/test", True, True),
+        )
+        lease = ControlLease(.3, clock=lambda: now[0]); sink = Sink()
+        motor = _VerifiedPhysicalMotorBoundary(sink, lease, max_rpm=20)
+        runtime = BlockingRuntime(config, Source(), Source(), motor=motor, odometry=Odometry(), clock=lambda: now[0], lease=lease)
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            # Establish the deadline from the fresh sample, then cross only
+            # that deadline (not the 120 ms control-stall or 300 ms lease).
+            runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
+            now[0] = .101
+            runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
+
+            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            self.assertEqual(runtime.machine.state, State.FAULT)
+            self.assertEqual(len(sink.stops), 1)
+            self.assertFalse(runtime.motor.armed)
+            with self.assertRaises(ValueError):
+                runtime.manual_command(WheelCommand(1, 1, "after odometry watchdog"))
+            self.assertEqual(sink.commands, [])
+            self.assertEqual(len(sink.stops), 1)
+        finally:
+            runtime.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -481,7 +481,8 @@ Do not guess:
 
 These must come from project configuration or verified project documentation.
 
-User-configured RPM refers to the output shaft where specified.
+All field-configured command RPM refers to motor-side RPM before the gearbox;
+wheel RPM is derived only through `DriveGeometry.motor_turns_per_wheel_turn`.
 
 Make motor-side/output-side conversions explicit and testable.
 
@@ -979,7 +980,7 @@ Examples:
 
 Do not mix:
 
-* motor RPM and output-shaft RPM;
+* motor-side RPM and derived wheel RPM;
 * degrees and radians;
 * seconds and milliseconds;
 * meters and millimeters;
@@ -1204,5 +1205,4 @@ When deciding whether to return control to the user, ask:
 If useful unblocked work remains:
 
 **DO THE WORK. DO NOT STOP TO ASK FOR PERMISSION TO CONTINUE.**
-
 

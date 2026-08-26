@@ -37,17 +37,36 @@ class SafetyConfig:
     turn_marker_confirm_frames: int = 3
     turn_marker_rearm_distance_m: float = 0.5
     in_row_turn_enabled: bool = False
+    new_row_turn_direction: str = "right"
+    # Inherited from verified OAK navigation; calibration pending on this robot.
+    in_row_turn_wheel_degrees: float = 720.0
+    inner_wheel_min_ratio: float = 0.0
+    turn_timeout_s: float = 8.0
+    turn_distance_tolerance_m: float = 0.05
+    turn_heading_tolerance_deg: float = 8.0
+    turn_heading_confirm_frames: int = 3
+    turn_heading_max_age_s: float = .2
     number_of_rows: int = 1
 
     def validate(self) -> "SafetyConfig":
         nonnegative = (self.auto_start_delay_s, self.navigation_lost_timeout_s,
                        self.search_length_m, self.max_pick_wait_s,
                        self.pick_clear_time_s, self.post_pick_lockout_distance_m,
-                       self.turn_marker_rearm_distance_m)
+                       self.turn_marker_rearm_distance_m, self.in_row_turn_wheel_degrees,
+                       self.turn_timeout_s, self.turn_distance_tolerance_m,
+                       self.turn_heading_tolerance_deg, self.turn_heading_max_age_s)
         if not all(math.isfinite(value) and value >= 0 for value in nonnegative):
             raise ValueError("tids- och sträckgränser måste vara ändliga och icke-negativa")
         if self.navigation_reacquire_frames < 1 or self.turn_marker_confirm_frames < 1:
             raise ValueError("frame-bekräftelse måste vara minst 1")
+        if self.turn_heading_confirm_frames < 1:
+            raise ValueError("turn heading-bekräftelse måste vara minst 1")
+        if self.new_row_turn_direction not in ("left", "right"):
+            raise ValueError("new_row_turn_direction måste vara left eller right")
+        if self.in_row_turn_wheel_degrees <= 0 or self.turn_timeout_s <= 0 or self.turn_heading_max_age_s <= 0:
+            raise ValueError("turn wheel-degrees, timeout och heading-ålder måste vara positiva")
+        if not 0 <= self.inner_wheel_min_ratio <= 1:
+            raise ValueError("inner_wheel_min_ratio måste ligga mellan 0 och 1")
         if self.number_of_rows < 1:
             raise ValueError("number_of_rows måste vara minst 1")
         return self

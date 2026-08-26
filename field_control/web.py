@@ -8,6 +8,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from .control import WheelCommand
 from .diagnostics import status_payload
 from .runtime import FieldControlRuntime
 
@@ -41,6 +42,27 @@ class DiagnosticsServer:
 
             def do_POST(self) -> None:
                 path = urlsplit(self.path).path
+                manual_directions = {
+                    # WheelCommand is logical vehicle direction. The verified
+                    # remote physical worker applies its configured per-motor
+                    # forward signs exactly once when constructing raw A2.
+                    "/api/manual/forward": (1.0, 1.0, "forward"),
+                    "/api/manual/reverse": (-1.0, -1.0, "reverse"),
+                    "/api/manual/left": (-1.0, 1.0, "left"),
+                    "/api/manual/right": (1.0, -1.0, "right"),
+                }
+                if path in manual_directions:
+                    rpm = runtime.config.manual_rpm
+                    if rpm <= 0:
+                        self._conflict("manual_rpm måste vara positiv för manuell körning"); return
+                    left, right, direction = manual_directions[path]
+                    try:
+                        # Client input never supplies RPM. Runtime enforces
+                        # MANUAL, lifecycle, armed output and the shared lease.
+                        runtime.manual_command(WheelCommand(left * rpm, right * rpm, f"web-manual-{direction}"))
+                    except (ValueError, RuntimeError) as exc:
+                        self._conflict(str(exc)); return
+                    self._status(); return
                 actions = {
                     "/api/manual": runtime.select_manual,
                     "/api/auto": runtime.select_auto,
@@ -53,9 +75,15 @@ class DiagnosticsServer:
                 try:
                     action()
                 except (ValueError, RuntimeError) as exc:
-                    body = json.dumps({"error": str(exc)}, ensure_ascii=True).encode()
-                    self.send_response(HTTPStatus.CONFLICT); self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                    self._conflict(str(exc)); return
+                self._status()
+
+            def _conflict(self, message: str) -> None:
+                body = json.dumps({"error": message}, ensure_ascii=True).encode()
+                self.send_response(HTTPStatus.CONFLICT); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def _status(self) -> None:
                 body = json.dumps(status_payload(runtime), ensure_ascii=True).encode()
                 self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -97,7 +125,7 @@ DASHBOARD_HTML = """<!doctype html>
 :root{font-family:ui-sans-serif,system-ui,sans-serif;color:#17212b;background:#eef2f3;--ink:#17212b;--muted:#65727b;--line:#cbd5d8;--accent:#d9573f;--ok:#197a5d}
 *{box-sizing:border-box}body{margin:0}.top{background:#173d3a;color:white;padding:20px 5vw;display:flex;justify-content:space-between;align-items:center;gap:20px}.top h1{margin:0;font-size:22px}.top span{color:#b9d5cb;font-size:13px}main{max-width:1200px;margin:24px auto;padding:0 20px}.actions{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}button{border:0;border-radius:5px;padding:11px 16px;font-weight:700;cursor:pointer;color:white;background:#173d3a}button.stop{background:var(--accent)}button:disabled{opacity:.45;cursor:not-allowed}.layout{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{background:white;border:1px solid var(--line);border-radius:6px;padding:16px}.panel h2{font-size:15px;margin:0 0 12px;color:#173d3a}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric{border-top:1px solid #e5eaeb;padding-top:8px}.label{display:block;color:var(--muted);font-size:12px}.value{font-size:18px;font-weight:700;overflow-wrap:anywhere}.ok{color:var(--ok)}.bad{color:var(--accent)}.streams{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.streams img{width:100%;aspect-ratio:4/3;object-fit:contain;background:#17212b;border-radius:4px}.streams h3{font-size:13px;margin:0 0 6px}.fault{color:var(--accent);min-height:20px;font-weight:700}@media(max-width:760px){.layout,.streams{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
 </style></head><body><header class="top"><div><h1>Field Control</h1><span>Runtime diagnostics</span></div><strong id="state">Loading</strong></header>
-<main><div class="actions"><button onclick="post('/api/manual')">MANUAL</button><button onclick="post('/api/auto')">AUTO</button><button onclick="post('/api/start-auto')">START AUTO</button><button class="stop" onclick="post('/api/stop')">STOP</button></div>
+<main><div class="actions"><button onclick="post('/api/manual')">MANUAL</button><button onclick="post('/api/auto')">AUTO</button><button onclick="post('/api/start-auto')">START AUTO</button><button onclick="post('/api/manual/forward')">FORWARD (fixed motor RPM)</button><button onclick="post('/api/manual/reverse')">REVERSE (fixed motor RPM)</button><button onclick="post('/api/manual/left')">LEFT (fixed motor RPM)</button><button onclick="post('/api/manual/right')">RIGHT (fixed motor RPM)</button><button class="stop" onclick="post('/api/stop')">STOP</button></div><p>Manual drive is accepted only in MANUAL with already armed output; each press refreshes the bounded control lease. These buttons never arm motors.</p>
 <div class="layout"><section class="panel"><h2>Runtime</h2><div class="grid"><div class="metric"><span class="label">Mode</span><span class="value" id="mode">-</span></div><div class="metric"><span class="label">State</span><span class="value" id="state2">-</span></div><div class="metric"><span class="label">Row / pass</span><span class="value" id="row">-</span></div><div class="metric"><span class="label">Motor output</span><span class="value" id="armed">-</span></div></div><p class="fault" id="fault"></p></section>
 <section class="panel"><h2>Sensors</h2><div class="grid"><div class="metric"><span class="label">Camera</span><span class="value" id="camera">-</span></div><div class="metric"><span class="label">IMU</span><span class="value" id="imu">-</span></div><div class="metric"><span class="label">Camera age</span><span class="value" id="camera-age">-</span></div><div class="metric"><span class="label">IMU age</span><span class="value" id="imu-age">-</span></div></div></section>
 <section class="panel"><h2>Heading</h2><div class="grid"><div class="metric"><span class="label">Filtered</span><span class="value" id="heading">-</span></div><div class="metric"><span class="label">Row reference</span><span class="value" id="reference">-</span></div><div class="metric"><span class="label">Error</span><span class="value" id="heading-error">-</span></div><div class="metric"><span class="label">Reference build distance</span><span class="value" id="build-distance">-</span></div></div></section>

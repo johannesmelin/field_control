@@ -12,6 +12,9 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
     vision = None if observation is None or observation.vision is None else observation.vision
     heading = None if observation is None else observation.heading_deg
     reference = None if observation is None else observation.row_heading_reference_deg
+    odometry_distance = (None if observation is None else
+                         (observation.odometry_sample.forward_distance_m
+                          if observation.odometry_sample is not None else observation.distance_m))
     target_x = None if vision is None else vision.target_x
     x_goal_px = runtime.config.vision.x_goal * runtime.config.processing_width
     heading_error = None if heading is None or reference is None else (reference - heading + 180.0) % 360.0 - 180.0
@@ -32,7 +35,10 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
                 "error": None if observation is None else observation.imu_error},
         "odometry": {"ok": False if observation is None else observation.odometry_fresh,
                       "age_s": None if observation is None else observation.odometry_age_s,
-                      "distance_m": None if observation is None else observation.distance_m},
+                      "distance_m": odometry_distance,
+                      "left_distance_m": None if observation is None or observation.odometry_sample is None else observation.odometry_sample.left_distance_m,
+                      "right_distance_m": None if observation is None or observation.odometry_sample is None else observation.odometry_sample.right_distance_m,
+                      "yaw_change_deg": None if observation is None or observation.odometry_sample is None else observation.odometry_sample.yaw_change_deg},
         "heading": {"filtered_heading_deg": heading, "row_heading_reference_deg": reference,
                     "reference_reliable": False if observation is None else observation.row_heading_reliable,
                     "reference_build_distance_m": runtime.heading.reference.reliable_distance_m,
@@ -53,4 +59,5 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
             "left_rpm": status.last_command.left_rpm, "right_rpm": status.last_command.right_rpm,
             "source": status.last_command.source,
         },
+        "recent_events": runtime.events.recent(),
     }

@@ -1,4 +1,4 @@
-"""Pure differential-drive odometry using verified RMD-X6 8:1 semantics."""
+"""Differential-drive geometry; motor RPM commands are before the 8:1 gearbox."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,6 +23,22 @@ class DriveGeometry:
         )):
             raise ValueError("robotgeometrin måste vara ändlig och positiv")
         return self
+
+
+def motor_rpm_to_wheel_rpm(motor_rpm: float, geometry: DriveGeometry) -> float:
+    """Convert motor-side RPM to wheel RPM using the sole configured ratio."""
+    geometry.validate()
+    if not isinstance(motor_rpm, (int, float)) or isinstance(motor_rpm, bool) or not math.isfinite(motor_rpm):
+        raise ValueError("motor-rpm måste vara ändligt")
+    return float(motor_rpm) / geometry.motor_turns_per_wheel_turn
+
+
+def wheel_rpm_to_motor_rpm(wheel_rpm: float, geometry: DriveGeometry) -> float:
+    """Convert wheel RPM to motor-side RPM; do not use in CAN send paths."""
+    geometry.validate()
+    if not isinstance(wheel_rpm, (int, float)) or isinstance(wheel_rpm, bool) or not math.isfinite(wheel_rpm):
+        raise ValueError("hjul-rpm måste vara ändligt")
+    return float(wheel_rpm) * geometry.motor_turns_per_wheel_turn
 
 
 def wheel_distance_m(initial_deg: float, current_deg: float, circumference_m: float,
