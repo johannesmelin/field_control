@@ -13,6 +13,7 @@ class FakeRuntime:
     def __init__(self, rpm=6.0, error: Exception | None = None):
         self.config = SimpleNamespace(manual_rpm=rpm, stream_fps=5)
         self.commands = []; self.error = error
+        self.images = {}
     def manual_command(self, command):
         if self.error is not None: raise self.error
         self.commands.append(command)
@@ -20,6 +21,7 @@ class FakeRuntime:
     def select_auto(self): pass
     def start_auto(self): pass
     def stop(self): pass
+    def latest_image(self, view): return self.images.get(view)
 
 
 class ManualWebTests(unittest.TestCase):
@@ -50,6 +52,39 @@ class ManualWebTests(unittest.TestCase):
         self.assertEqual(response, [200])
         self.assertIn(("Content-Type", "text/html; charset=utf-8"), headers)
         self.assertIn(("Cache-Control", "no-store"), headers)
+
+    def test_snapshot_routes_return_one_cache_free_latest_jpeg(self):
+        runtime = FakeRuntime(); runtime.images["raw"] = b"jpeg-bytes"
+        server = object.__new__(DiagnosticsServer); server.runtime = runtime
+        handler = object.__new__(server._handler())
+        response, headers = [], []
+        handler.path = "/snapshot/raw?ignored=cache-bust"; handler.wfile = io.BytesIO()
+        handler.send_response = lambda status, *_args: response.append(status)
+        handler.send_header = lambda name, value: headers.append((name, value))
+        handler.end_headers = lambda: None
+        handler.do_GET()
+
+        self.assertEqual(response, [200])
+        self.assertEqual(handler.wfile.getvalue(), b"jpeg-bytes")
+        self.assertIn(("Content-Type", "image/jpeg"), headers)
+        self.assertIn(("Cache-Control", "no-store, no-cache, must-revalidate"), headers)
+        self.assertIn(("Pragma", "no-cache"), headers)
+        self.assertIn(("Expires", "0"), headers)
+
+    def test_snapshot_returns_no_content_until_a_latest_frame_exists(self):
+        runtime = FakeRuntime()
+        server = object.__new__(DiagnosticsServer); server.runtime = runtime
+        handler = object.__new__(server._handler())
+        response, headers = [], []
+        handler.path = "/snapshot/overlay"; handler.wfile = io.BytesIO()
+        handler.send_response = lambda status, *_args: response.append(status)
+        handler.send_header = lambda name, value: headers.append((name, value))
+        handler.end_headers = lambda: None
+        handler.do_GET()
+
+        self.assertEqual(response, [204])
+        self.assertEqual(handler.wfile.getvalue(), b"")
+        self.assertIn(("Cache-Control", "no-store, no-cache, must-revalidate"), headers)
 
     def test_direction_routes_use_only_fixed_motor_side_manual_rpm(self):
         runtime = FakeRuntime(6.0)
@@ -110,6 +145,50 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn("/api/manual/hold", DASHBOARD_HTML)
         self.assertIn("function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}", DASHBOARD_HTML)
         self.assertNotIn("/api/arm-motor-output", DASHBOARD_HTML)
+
+    def test_dashboard_uses_bounded_cache_free_snapshot_polling_not_mjpeg(self):
+        from field_control.web import DASHBOARD_HTML
+
+        for view in ("raw", "overlay", "buds", "leaves"):
+            self.assertIn(f'data-snapshot-view="{view}"', DASHBOARD_HTML)
+        self.assertNotIn('src="/stream/raw"', DASHBOARD_HTML)
+        self.assertIn("const snapshotPollMs=100;", DASHBOARD_HTML)
+        self.assertIn("if(snapshot.inFlight)return;", DASHBOARD_HTML)
+        self.assertIn("fetch(`/snapshot/${view}?t=${Date.now()}`,{cache:'no-store'})", DASHBOARD_HTML)
+        self.assertIn("URL.createObjectURL(await response.blob())", DASHBOARD_HTML)
+
+    def test_snapshot_client_reclaims_rapid_superseded_urls_only_after_replacement_loads(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # Regression sequence for the dashboard's pending/current URL state:
+        # rapid A -> B -> C replies before an image load must discard A and B;
+        # the displayed C remains valid until D has loaded.
+        pending = current = None; revoked = []
+        def reply(url):
+            nonlocal pending
+            superseded = pending; pending = url
+            if superseded: revoked.append(superseded)
+        def loaded(url):
+            nonlocal pending, current
+            if pending != url: return
+            previous = current; current = pending; pending = None
+            if previous: revoked.append(previous)
+
+        reply("A"); reply("B"); reply("C")
+        self.assertEqual(revoked, ["A", "B"])
+        loaded("C"); self.assertEqual(current, "C")
+        reply("D"); self.assertNotIn("C", revoked)
+        loaded("D")
+        self.assertEqual((current, pending, revoked), ("D", None, ["A", "B", "C"]))
+
+        # Keep that lifecycle mechanically tied to the actual client code.
+        self.assertIn("const snapshot={inFlight:false,currentUrl:null,pendingUrl:null};", DASHBOARD_HTML)
+        self.assertIn("image.addEventListener('load',()=>{", DASHBOARD_HTML)
+        self.assertIn("if(!nextUrl||image.currentSrc!==nextUrl)return;", DASHBOARD_HTML)
+        self.assertIn("const supersededUrl=snapshot.pendingUrl;", DASHBOARD_HTML)
+        self.assertIn("if(supersededUrl)URL.revokeObjectURL(supersededUrl);", DASHBOARD_HTML)
+        self.assertIn("if(previousUrl)URL.revokeObjectURL(previousUrl);", DASHBOARD_HTML)
+        self.assertNotIn("image.onload=", DASHBOARD_HTML)
 
     def test_dashboard_disables_mode_selection_for_ready_physical_manual_standby(self):
         from field_control.web import DASHBOARD_HTML

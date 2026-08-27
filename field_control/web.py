@@ -36,6 +36,8 @@ class DiagnosticsServer:
                     self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
                 if path in ("/stream/raw", "/stream/overlay", "/stream/buds", "/stream/leaves", "/stream/marker"):
                     self._stream(path.rsplit("/", 1)[-1]); return
+                if path in ("/snapshot/raw", "/snapshot/overlay", "/snapshot/buds", "/snapshot/leaves", "/snapshot/marker"):
+                    self._snapshot(path.rsplit("/", 1)[-1]); return
                 body = DASHBOARD_HTML.encode("utf-8")
                 self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -123,6 +125,25 @@ class DiagnosticsServer:
                 except (BrokenPipeError, ConnectionResetError):
                     return
 
+            def _snapshot(self, view: str) -> None:
+                """Return one latest-value JPEG without keeping a proxy-sensitive stream open."""
+                image = runtime.latest_image(view)
+                if image is None:
+                    self.send_response(HTTPStatus.NO_CONTENT)
+                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.end_headers()
+                    return
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Content-Length", str(len(image)))
+                self.end_headers()
+                self.wfile.write(image)
+
             def log_message(self, *_args) -> None:
                 return
 
@@ -150,7 +171,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="panel"><h2>Sensors</h2><div class="grid"><div class="metric"><span class="label">Camera</span><span class="value" id="camera">-</span></div><div class="metric"><span class="label">IMU</span><span class="value" id="imu">-</span></div><div class="metric"><span class="label">Camera age</span><span class="value" id="camera-age">-</span></div><div class="metric"><span class="label">IMU age</span><span class="value" id="imu-age">-</span></div></div></section>
 <section class="panel"><h2>Heading</h2><div class="grid"><div class="metric"><span class="label">Filtered</span><span class="value" id="heading">-</span></div><div class="metric"><span class="label">Row reference</span><span class="value" id="reference">-</span></div><div class="metric"><span class="label">Error</span><span class="value" id="heading-error">-</span></div><div class="metric"><span class="label">Reference build distance</span><span class="value" id="build-distance">-</span></div></div></section>
 <section class="panel"><h2>Vision and odometry</h2><div class="grid"><div class="metric"><span class="label">Target x / goal</span><span class="value" id="target">-</span></div><div class="metric"><span class="label">Marker</span><span class="value" id="marker">-</span></div><div class="metric"><span class="label">Distance</span><span class="value" id="distance">-</span></div><div class="metric"><span class="label">Search distance</span><span class="value" id="search">-</span></div></div></section></div>
-<section class="panel" style="margin-top:16px"><h2>Live views</h2><div class="streams"><div><h3>Original</h3><img src="/stream/raw" alt="Original camera"></div><div><h3>Overlay</h3><img src="/stream/overlay" alt="Vision overlay"></div><div><h3>Buds mask</h3><img src="/stream/buds" alt="Buds mask"></div><div><h3>Leaves mask</h3><img src="/stream/leaves" alt="Leaves mask"></div></div></section></main>
+<section class="panel" style="margin-top:16px"><h2>Live views</h2><div class="streams"><div><h3>Original</h3><img data-snapshot-view="raw" alt="Original camera"></div><div><h3>Overlay</h3><img data-snapshot-view="overlay" alt="Vision overlay"></div><div><h3>Buds mask</h3><img data-snapshot-view="buds" alt="Buds mask"></div><div><h3>Leaves mask</h3><img data-snapshot-view="leaves" alt="Leaves mask"></div></div></section></main>
 <script>
 const text=(id,value)=>document.getElementById(id).textContent=value??'-';
 const fmt=(value,suffix='')=>value===null||value===undefined?'-':Number(value).toFixed(2)+suffix;
@@ -170,4 +191,44 @@ document.querySelectorAll('[data-manual-path]').forEach(button=>{const down=e=>{
 document.getElementById('stop').addEventListener('click',stopManual);window.addEventListener('blur',stopManual);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopManual()});
 async function refresh(){try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();const manualReady=p.mode==='MANUAL'&&p.physical_web_standby.active;text('state',p.state);text('state2',p.state);text('mode',p.mode);text('row',`${p.row_number} / ${p.pass_number}`);text('armed',p.motor_output_armed?'ARMED':'DISARMED');text('standby',p.physical_web_standby.active?'READY (no motion)':'-');document.getElementById('manual-mode').disabled=manualReady;text('manual-help',manualReady?'Manual is already ready. Hold a direction button; do not press MANUAL.':'Select MANUAL before using a direction button. Hold a manual button to drive.');text('fault',p.fault||'');text('camera',p.camera.ok?'OK':'FAULT');text('imu',p.imu.ok?'OK':'FAULT');text('camera-age',fmt(p.camera.age_s,' s'));text('imu-age',fmt(p.imu.age_s,' s'));text('heading',fmt(p.heading.filtered_heading_deg,' deg'));text('reference',fmt(p.heading.row_heading_reference_deg,' deg'));text('heading-error',fmt(p.heading.heading_error_deg,' deg'));text('build-distance',fmt(p.heading.reference_build_distance_m,' m'));text('target',`${fmt(p.vision.target_x_px,' px')} / ${fmt(p.vision.x_goal_px,' px')}`);text('marker',p.vision.marker_found?'FOUND':'-');text('distance',fmt(p.odometry.distance_m,' m'));text('search',fmt(p.search_distance_m,' m'));}catch(e){text('fault','Diagnostics unavailable')}}
 refresh();setInterval(refresh,1000);
+// VS Code SSH forwarding can buffer multipart MJPEG responses.  Polling
+// individual latest-value JPEGs avoids that proxy behaviour.  Each view has
+// one in-flight request, so a slow client cannot accumulate stale frames.
+const snapshotPollMs=100;
+document.querySelectorAll('[data-snapshot-view]').forEach(image=>{
+  const snapshot={inFlight:false,currentUrl:null,pendingUrl:null};
+  // Keep the last decoded image alive until its replacement is decoded.  A
+  // newer response can supersede an undecoded pending blob immediately;
+  // intermediate blob URLs are then released even when load events race.
+  image.addEventListener('load',()=>{
+    const nextUrl=snapshot.pendingUrl;
+    if(!nextUrl||image.currentSrc!==nextUrl)return;
+    snapshot.pendingUrl=null;
+    const previousUrl=snapshot.currentUrl;
+    snapshot.currentUrl=nextUrl;
+    if(previousUrl)URL.revokeObjectURL(previousUrl);
+  });
+  image.addEventListener('error',()=>{
+    const failedUrl=snapshot.pendingUrl;
+    if(failedUrl&&image.currentSrc===failedUrl){snapshot.pendingUrl=null;URL.revokeObjectURL(failedUrl);}
+  });
+  async function loadSnapshot(){
+    if(snapshot.inFlight)return;
+    snapshot.inFlight=true;
+    try{
+      const view=image.dataset.snapshotView;
+      const response=await fetch(`/snapshot/${view}?t=${Date.now()}`,{cache:'no-store'});
+      if(response.status===204)return;
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
+      const nextUrl=URL.createObjectURL(await response.blob());
+      const supersededUrl=snapshot.pendingUrl;
+      snapshot.pendingUrl=nextUrl;
+      if(supersededUrl)URL.revokeObjectURL(supersededUrl);
+      image.src=nextUrl;
+    }catch(_error){
+      // Diagnostics video is best-effort; status polling remains independent.
+    }finally{snapshot.inFlight=false;}
+  }
+  loadSnapshot();setInterval(loadSnapshot,snapshotPollMs);
+});
 </script></body></html>"""

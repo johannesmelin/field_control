@@ -443,9 +443,16 @@ API och streams:
 - `GET /stream/buds` - buds-mask.
 - `GET /stream/leaves` - leaves-mask.
 - `GET /stream/marker` - turn-marker-mask.
+- `GET /snapshot/{raw,overlay,buds,leaves,marker}` - en cachefri aktuell
+  JPEG-bild per anrop.
 
 Dashboarden är ett diagnostics- och operatörsgränssnitt. Den armerar inte
 motorer och kan inte kringgå lease eller motorboundary.
+
+Dashboardens fyra live-vyer använder `snapshot`-vägen med 10 Hz polling och
+högst en pågående hämtning per vy. Det undviker att långlivade MJPEG-svar
+buffras i VS Code:s SSH-portvidarebefordran. De äldre `/stream/...`-vägarna
+finns kvar för kompatibilitet med externa MJPEG-klienter.
 
 ## State machine
 
