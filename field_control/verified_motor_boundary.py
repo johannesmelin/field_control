@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from typing import Callable, Protocol
 
 from .control import WheelCommand
@@ -23,6 +24,10 @@ class VerifiedMotorSink(Protocol):
     def close(self) -> None: ...
     def set_fault_callback(self, callback: Callable[[str], None]) -> None: ...
     def read_multi_turn_angles(self) -> tuple[float, float]: ...
+    def begin_wheel_position_move(self, *, left_wheel_degrees: float, right_wheel_degrees: float,
+                                  max_motor_rpm: float, motor_turns_per_wheel_turn: float,
+                                  tolerance_wheel_degrees: float, timeout_s: float, deadline_s: float) -> object: ...
+    def position_move_status(self, request: object) -> object: ...
 
 
 class SharedCanEncoderBackend:
@@ -46,6 +51,9 @@ class SharedCanEncoderBackend:
         self._admission_lock = threading.Lock()
 
     def angles(self) -> tuple[float, float]:
+        return self.angles_with_timestamp()[0]
+
+    def angles_with_timestamp(self) -> tuple[tuple[float, float], float]:
         # Do not release this gate until the sink has either accepted and
         # completed the bounded request or rejected it.  ``begin_shutdown``
         # shares this exact gate, making its return the linearization point
@@ -54,7 +62,11 @@ class SharedCanEncoderBackend:
             if self._shutdown.is_set():
                 raise RuntimeError("delad encoderadapter är stängd")
             try:
-                angles = self._sink.read_multi_turn_angles()
+                sample_reader = getattr(self._sink, "read_multi_turn_angles_sample", None)
+                if callable(sample_reader):
+                    angles, acquired_at_s = sample_reader()
+                else:
+                    angles, acquired_at_s = self._sink.read_multi_turn_angles(), time.monotonic()
             except Exception as exc:
                 # Once this adapter has been cancelled that result is terminal;
                 # never queue another uncorrelatable 0x92 read.
@@ -70,7 +82,10 @@ class SharedCanEncoderBackend:
                 or not all(isinstance(item, (int, float)) and not isinstance(item, bool)
                            and math.isfinite(item) for item in angles)):
             raise MotorOutputFault("verifierad CAN-worker returnerade ogiltig flervarvsvinkel")
-        return float(angles[0]), float(angles[1])
+        if (not isinstance(acquired_at_s, (int, float)) or isinstance(acquired_at_s, bool)
+                or not math.isfinite(acquired_at_s) or acquired_at_s < 0):
+            raise MotorOutputFault("verifierad CAN-worker returnerade ogiltig 0x92-tid")
+        return (float(angles[0]), float(angles[1])), float(acquired_at_s)
 
     def close(self) -> None:
         # Deliberately non-owning: no socket or motor sink is closed here.
@@ -112,6 +127,7 @@ class _VerifiedPhysicalMotorBoundary:
         self._sink, self._lease, self._max_rpm = sink, lease, float(max_rpm)
         self._lock = threading.RLock()
         self._armed_token: str | None = None
+        self._web_standby = False
         self._fault_reason: str | None = None
         self._closing = False
         self._closed = False
@@ -124,7 +140,13 @@ class _VerifiedPhysicalMotorBoundary:
 
     @property
     def armed(self) -> bool:
-        with self._lock: return self._armed_token is not None and self._fault_reason is None
+        with self._lock:
+            return (self._armed_token is not None or self._web_standby) and self._fault_reason is None
+
+    @property
+    def web_standby_active(self) -> bool:
+        with self._lock:
+            return self._web_standby and not self._closing and not self._closed and self._fault_reason is None
 
     @property
     def fault_reason(self) -> str | None:
@@ -148,6 +170,7 @@ class _VerifiedPhysicalMotorBoundary:
             if self._closing or self._closed or self._fault_reason is not None or not self._lease.valid(token):
                 raise PhysicalOutputDisabled("control-lease löpte ut under armering")
             self._armed_token = token
+            self._web_standby = False
             self.events.append(("armed", 0.0, 0.0, "verifierat STOP+0x9C-settle"))
 
     def command(self, command: WheelCommand, token: str | None = None) -> None:
@@ -174,9 +197,95 @@ class _VerifiedPhysicalMotorBoundary:
         self._sink.stop_all(reason)
         self.events.append(("hold-stop", 0.0, 0.0, reason))
 
+    def enter_web_standby(self, token: str | None) -> None:
+        """Atomically exchange a just-armed drive lease for no-motion standby."""
+        with self._lock:
+            if (self._closing or self._closed or self._fault_reason is not None
+                    or token is None or token != self._armed_token):
+                raise PhysicalOutputDisabled("motorutgången kan inte övergå till webb-standby")
+        # Keep the global lock order lease -> boundary, matching command().
+        # A STOP that wins after this release has already made the output safe;
+        # the second boundary check below then rejects standby establishment.
+        if not self._lease.release(token):
+            raise PhysicalOutputDisabled("control-lease löpte ut före webb-standby")
+        with self._lock:
+            if (self._closing or self._closed or self._fault_reason is not None
+                    or token != self._armed_token):
+                raise PhysicalOutputDisabled("webbstandby avbröts av STOP eller fel")
+            self._armed_token = None
+            self._web_standby = True
+            self.events.append(("web-standby", 0.0, 0.0, "lokal no-motion handoff"))
+
+    def claim_web_standby(self, token: str | None) -> None:
+        """Claim stopped standby using a newly acquired ordinary lease."""
+        if not self._lease.valid(token):
+            raise PhysicalOutputDisabled("webbstandby saknar ny control-lease")
+        with self._lock:
+            if (self._closing or self._closed or self._fault_reason is not None
+                    or not self._web_standby):
+                raise PhysicalOutputDisabled("webb-standby kan inte tas över")
+            self._web_standby = False
+            self._armed_token = token
+            self.events.append(("web-standby-claimed", 0.0, 0.0, "ny control-lease"))
+
+    def begin_wheel_position_move(self, *, left_wheel_degrees: float, right_wheel_degrees: float,
+                                  max_motor_rpm: float, motor_turns_per_wheel_turn: float,
+                                  tolerance_wheel_degrees: float, timeout_s: float,
+                                  deadline_s: float,
+                                  token: str | None = None) -> object:
+        if not self._lease.valid(token):
+            self.stop_all("A4-positionering saknar control-lease")
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
+        if (not isinstance(max_motor_rpm, (int, float)) or isinstance(max_motor_rpm, bool)
+                or not math.isfinite(max_motor_rpm) or max_motor_rpm <= 0):
+            raise ValueError("A4 max-rpm måste vara positiv och ändlig")
+        max_motor_rpm = min(float(max_motor_rpm), self._max_rpm)
+        with self._lock:
+            if self._closing or self._closed or self._fault_reason is not None or token != self._armed_token:
+                raise PhysicalOutputDisabled("motorutgång är inte armerad för A4-positionering")
+            request = self._sink.begin_wheel_position_move(
+                left_wheel_degrees=left_wheel_degrees, right_wheel_degrees=right_wheel_degrees,
+                max_motor_rpm=max_motor_rpm, motor_turns_per_wheel_turn=motor_turns_per_wheel_turn,
+                tolerance_wheel_degrees=tolerance_wheel_degrees, timeout_s=timeout_s, deadline_s=deadline_s,
+            )
+            self.events.append(("position", left_wheel_degrees, right_wheel_degrees, "turn A4"))
+            return request
+
+    def position_move_status(self, request: object) -> tuple[bool, bool, str | None, bool]:
+        status = self._sink.position_move_status(request)
+        done, succeeded, error, active = (getattr(status, "done", None), getattr(status, "succeeded", None),
+                                          getattr(status, "error", None), getattr(status, "active", None))
+        if (not isinstance(done, bool) or not isinstance(succeeded, bool) or not isinstance(active, bool)
+                or (error is not None and not isinstance(error, str))):
+            raise MotorOutputFault("verifierad CAN-worker returnerade ogiltig A4-status")
+        return done, succeeded, error, active
+
+    def position_move_stage(self, request: object) -> tuple[bool, bool]:
+        """Return worker-authored A4 acknowledgement/running evidence only.
+
+        A queue claim is not sufficient for a STOP-under-A4 HIL assertion:
+        this evidence becomes true only after both sequential A4 replies.
+        """
+        status = self._sink.position_move_status(request)
+        acknowledged = getattr(status, "a4_targets_acknowledged", None)
+        running = getattr(status, "target_running", None)
+        if not isinstance(acknowledged, bool) or not isinstance(running, bool):
+            raise MotorOutputFault("verifierad CAN-worker saknar A4-målstatus")
+        return acknowledged, running
+
+    def stop_and_settle_for_restart(self, reason: str = "STOP") -> None:
+        """Public bounded STOP followed by verified 0x9C zero-speed settle."""
+        self.stop_all(reason)
+        try:
+            self._sink.stop_and_settle_for_restart()
+        except Exception as exc:
+            self._latch_fault(f"STOP+0x9C-settle misslyckades: {exc}")
+            raise MotorOutputFault(self._fault_reason or "STOP+0x9C-settle misslyckades") from exc
+
     def stop_all(self, reason: str) -> None:
         with self._lock:
             self._armed_token = None
+            self._web_standby = False
             if self._closing or self._closed:
                 return
         if not self._lease.revoke_any():
@@ -208,6 +317,7 @@ class _VerifiedPhysicalMotorBoundary:
                 return False
             self._closing = True
             self._armed_token = None
+            self._web_standby = False
             return True
 
     def _finish_close(self) -> None:
@@ -241,6 +351,7 @@ class _VerifiedPhysicalMotorBoundary:
             if self._fault_reason is None:
                 self._fault_reason = reason
             self._armed_token = None
+            self._web_standby = False
 
 
 def open_verified_boundary(*, channel: str, slcan_device: str, max_rpm: float,

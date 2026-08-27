@@ -203,14 +203,21 @@ och oberoende nödstopp tillgängligt:
 ### Phase A: automatisk in-row-turn, upphissade hjul
 
 Phase A testar den normala produktionsvägen `AUTO_IN_ROW_TURN` med riktig
-OAK-D SR/BNO086, delad fysisk CAN-odometri och `FieldControlApplication`. Den
-är uttryckligen **inte** en kalibrering eller ett test av lyckad vändning:
-hjulen är upphissade, så chassits heading kan inte nå 180°. Det enda godkända
-utfallet är därför `TURN_TIMEOUT`, följt av disarmerad STOP.
+OAK-D SR/BNO086, delad fysisk CAN-odometri och `FieldControlApplication`.
+Den kör den verifierade A4-modellen: färsk `0x92`-baslinje, ett begränsat A4-
+positionmål per motor och worker-bekräftelse av båda målen med `0x92`.
+Hjulen är upphissade, så detta är fortfarande inte en 180°-kalibrering eller
+headingkontroll. Ett godkänt resultat är däremot ett normalt
+`turn_completed` efter målbekräftelse, korrekt motriktad per-hjulsodometri
+inom konfigurerad turn-tolerans, följt av HIL-rutinens explicita MANUAL/STOP
+och disarmerad utgång.
 
 Profilen är tillfälligt fast för just denna Phase-A-HIL: en gul markör med HSV
 `26..36, 20..255, 150..255`, normal
-tre-frames markerdebounce, låg turn-hastighet `2 motor-RPM`, två sekunders monotont turn-timeout, samt noll
+tre-frames markerdebounce, fast turn-hastighet `40 motor-RPM`, monotont
+begränsad A4-måldeadline på 34 sekunder. Den härleds från det största
+720°-hjulmålet: `720 / 360 * 8 / 40 * 60 = 24 s`, plus en fast 10-sekunders
+marginal för bounded CAN/positionsettle, samt noll
 basfart och noll visuell korrigering före vändningen. Operatören placerar
 markören i kamerans bild innan testet; under den begränsade väntan förblir
 motorutgången disarmerad och inga icke-noll motorkommandon ges. Det finns inga CLI-flaggor för
@@ -239,83 +246,16 @@ och nödstoppet tillgängligt:
   --confirm-turn-not-calibrated
 ```
 
-Resultatet registrerar den oförändrade turn-planen, de kommenderade hjultecknen,
-per-hjuls encoderförändringar (minst 1 mm och med planens tecken) och normala runtime-event.
-Ett annat fel än
-`TURN_TIMEOUT`, en fortfarande armerad utgång eller avsaknad av normalt
-turn-kommando är underkänt. Gör ingen kalibrering av
-`in_row_turn_wheel_degrees` från Phase A.
+Resultatet registrerar den oförändrade turn-planen, per-hjuls
+encoderförändringar och normala runtime-event. Fel, felaktigt encodertecken,
+målavvikelse utanför `turn_distance_tolerance_m`, uteblivet
+`turn_completed` eller en fortfarande armerad utgång efter slutlig STOP är
+underkänt. Gör ingen kalibrering av `in_row_turn_wheel_degrees` från Phase A.
 
-### Phase A lång observation, upphissade hjul
-
-Detta är en separat, fast operatörsobservation och ersätter inte den korta
-Phase-A-kontrollen ovan. Den använder samma vanliga `AUTO_IN_ROW_TURN`-väg,
-samma tillfälliga gula markör och samma tre-frame-trigger, men håller den
-fasta turnprofilen på `2 motor-RPM` tills en fast monoton `TURN_TIMEOUT` efter
-30 s. Med 8:1-utväxling och 0,805 m hjulomkrets är den nominella
-hjulförflyttningen `2 / 8 / 60 * 30 * 0,805 = 0,100625 m` per hjul. Det är
-alltså ungefär 10 cm motriktad hjulrotation, tillräckligt för visuell
-bekräftelse men långt under den ärvda, okalibrerade 720°-planens 1,61 m per
-hjul och kan därför inte nå turnmålet genom profilen.
-
-Den är fortfarande inte en 180°-kalibrering eller ett lyckat turntest: på
-upphissade hjul måste enda godkända terminalresultatet vara `TURN_TIMEOUT`
-med disarmerad STOP. Encoderbeviset måste ha rätt tecken och ligga mellan 80
-och 120 % av nominella 10,0625 cm. Intervallet täcker o-kalibrerad
-hastighetsreglering och start/stop-sampling, men avvisar ett i praktiken
-stilla eller oväntat långt hjul. Hjulens observerade rörelse måste fortfarande
-bekräftas av operatören. Hastighet, riktning, markörväntan och tid kan inte
-ändras via CLI.
-
-Om ett terminalt fel uppstår skriver HIL-rutinen dessutom en begränsad
-felsökningspost i JSON efter att den normala säkra stängningen har slutförts.
-Den innehåller terminal runtime-status och senaste kommandokälla,
-odometrikällans anslutning/fel/ålder/senaste per-hjulsprov, de senaste
-runtime-eventen och den redan frigivna CAN-workerns diagnostikring. Denna
-insamling skickar inga extra CAN-ramar, öppnar inte om adaptern och ändrar inte
-turnprofilen. Särskilt `ODOMETRY_TIMEOUT` ska därför undersökas från denna
-post innan samma långa motorprov upprepas.
-
-Kör endast efter nytt uttryckligt operatörsbeslut, med upphissade hjul och
-oberoende nödstopp:
-
-```bash
-.venv/bin/python -m field_control.turn_phase_a_long_hil \
-  --slcan-device /dev/serial/by-id/<CANABLE-BY-ID> \
-  --enable-motors \
-  --confirm-physical-stop-tested \
-  --confirm-wheels-raised \
-  --confirm-turn-not-calibrated
-```
-
-### Phase A synlig observation, upphissade hjul
-
-Detta är en tredje, separat fast Phase-A-HIL för när den tidigare långsamma
-2-RPM-profilen inte är tillräckligt synlig. Den återanvänder samma normala
-`AUTO_IN_ROW_TURN`-livscykel, tillfälliga gula markör, tre-frame-trigger,
-CAN-fairness och fail-closed-diagnostik, men använder den redan fysiskt
-observerade hastigheten `10 motor-RPM` under en fast monoton timeout på `6,0 s`.
-Med 8:1-utväxling och 0,805 m hjulomkrets blir den nominella per-hjulsresan
-`10 / 8 / 60 * 6 * 0,805 = 0,100625 m` (cirka 10 cm). Den ändrar inte någon
-2-RPM-profil, produktionskonfiguration eller `in_row_turn_wheel_degrees`.
-
-Hjulen måste vara upphissade. Enda godkända terminalresultat är
-`TURN_TIMEOUT` med disarmerad STOP; encoderförändringen måste vara motriktad
-med planens tecken och ligga inom 80--120 % av den fasta nominella sträckan.
-Det är fortfarande inte en 180°-kalibrering eller ett lyckat turntest.
-Hastighet, riktning, markörväntan och tid kan inte ändras via CLI.
-
-Kör endast efter ett nytt uttryckligt operatörsbeslut, med upphissade hjul och
-oberoende nödstopp:
-
-```bash
-.venv/bin/python -m field_control.turn_phase_a_visible_hil \
-  --slcan-device /dev/serial/by-id/<CANABLE-BY-ID> \
-  --enable-motors \
-  --confirm-physical-stop-tested \
-  --confirm-wheels-raised \
-  --confirm-turn-not-calibrated
-```
+De äldre entrypointsen `turn_phase_a_long_hil` och
+`turn_phase_a_visible_hil` finns kvar endast för kompatibilitet och delegerar
+exakt till denna A4-rutin. De kan inte längre utföra en separat A2-
+hastighets-/timeoutkörning.
 
 ### Manuellt webb-kommando back, upphissade hjul
 
@@ -459,10 +399,10 @@ och gör inget påstående om 180°-kalibrering.
 ```
 
 Den integrerade Phase-A-runtime-HIL:en ovan verifierar redan den normala
-`AUTO_IN_ROW_TURN`-triggern, hjultecken/encoder och fail-closed
-`TURN_TIMEOUT` med explicit STOP. En verklig 180°-slutförande- och
-kalibreringskontroll kräver däremot fortsatt en rigg eller markkontakt som
-fysiskt vrider chassit/OAK-enheten, samt verifiering av heading-, encoder- och
+`AUTO_IN_ROW_TURN`-triggern, A4-målbekräftelse, hjultecken/encoder och
+explicit STOP/disarm efter ett lyckat mål. En verklig 180°-kalibreringskontroll
+kräver däremot fortsatt en rigg eller markkontakt som fysiskt vrider
+chassit/OAK-enheten, samt verifiering av heading-, encoder- och
 CAN-felbeteenden. Värdet `720` är endast en ärvd startpunkt och får inte kallas
 kalibrerat förrän den uppmätta 180°-manövern har godkänts.
 
@@ -578,7 +518,7 @@ Ett minimalt säkert JSON-dokument kan lämna fysisk output avstängd:
 `physical_can.enabled` till `true` kräver fortfarande alla separata
 raised-wheel-bekräftelser, `can0`, same-ID-profil och stabil by-id-sökväg.
 
-### Säker config- och diagnostics-CLI
+### Säker config-, diagnostics- och fysisk webb-CLI
 
 Installationen ger `field-control`. Den skriver och validerar enbart strikt
 JSON-konfiguration och startar vid normal körning diagnostics/runtime från en
@@ -592,8 +532,43 @@ field-control --config field_control.json --host 127.0.0.1 --port 8080
 
 Skrivning vägrar ersätta en befintlig fil utan `--force`. Normal CLI-körning
 avvisar alltid `physical_can.enabled`; den kan alltså inte öppna eller armera
-fysisk CAN. SIGINT/SIGTERM stänger applikationen kontrollerat. De separata
-raised-wheel-HIL-körarna är fortsatt den enda fysiska vägen.
+fysisk CAN. SIGINT/SIGTERM stänger applikationen kontrollerat.
+
+För fälttest via webben finns en separat och uttrycklig fysisk startväg. Den
+kräver en redan fullständigt validerad `physical_can`-konfiguration (inklusive
+marktest- eller upphissad-hjul-gates), bindning till en numerisk loopback-IP
+och två separata CLI-bekräftelser. Den startar alltid disarmerad; webbläsaren
+kan aldrig armera motorerna. Om lokal armering avsiktligt önskas görs den först
+efter att runtime, watchdog och färsk 0x92-odometri är igång och fortfarande i
+`MANUAL`. Den byts sedan omedelbart till en konfigurerbar (högst 60 s), helt
+stillastående webb-standby utan aktiv drive-lease. Första giltiga webbaserade
+MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 300 ms-lease. AUTO-
+valet ensamt kan inte förnya eller ta över den. Timeout, STOP, MANUAL-val,
+fel, CAN-/odometrifel, watchdog och stängning disarmerar standby:
+
+```bash
+field-control --config field_control_physical.json \
+  --physical-web --confirm-physical-web \
+  --host 127.0.0.1 --port 8080 \
+  --arm-motor-output
+```
+
+Utelämna `--arm-motor-output` för en fysisk CAN-diagnostikstart som förblir
+disarmerad. `--physical-web` avvisar andra adresser än loopback-IP; publicera
+inte dashboarden över nätverket innan en separat autentiserad design finns.
+STOP, kontroll-lease, watchdog och runtime-fel disarmerar fortsatt output.
+De separata raised-wheel-HIL-körarna används fortfarande för avgränsade
+motorprover.
+
+Den lokala testprofilen `field_control_web_test.json` använder `manual_rpm`
+`30` och `max_rpm` `40` (motor-RPM före 8:1-utväxlingen). En hållen
+riktningsknapp skickar den konfigurerade hastigheten. När knappen släpps
+skickar dashboarden därefter ett serverfixerat `0 RPM`-kommando var 100 ms och
+behåller den korta control-leasen, så ett nytt riktningskommando kan provas
+utan omstart. Den röda STOP-knappen, fokus-/sidförlust, nätfel eller uteblivna
+uppdateringar använder däremot hård STOP och disarmerar utgången. I den
+fysiska webbstandbyn är MANUAL redan valt; tryck inte MANUAL-knappen, utan
+håll direkt inne en riktningsknapp.
 
 Alla zoner använder normaliserade koordinater mellan `0.0` och `1.0`.
 
@@ -611,26 +586,25 @@ simulerad end-to-end-runtime. Testerna kräver inte CAN eller anslutna motorer.
 
 ## Hårdvarusäkerhet och återstående arbete
 
-### Pausad utredning: automatisk vändning
+### Automatisk vändning: A4-positionering redo för HIL
 
-Den synliga Phase-A-körningen med gul testmarkör och `10 motor-RPM` genomfördes
-med upphissade hjul, men operatören observerade ingen hjulrotation. CAN var
-efteråt `ERROR-ACTIVE` utan registrerade bussfel, men körarens terminalresultat
-kunde inte fångas och är därför inte ett godkänt motor- eller turnresultat.
-Den profilen får inte upprepas förrän orsaken har utretts.
+Den tidigare synliga Phase-A-körningen använde kontinuerliga `0xA2`-
+hastighetskommandon och är inte längre rätt HIL-väg. Automatisk in-row- och
+new-row-turn använder nu den tidigare verifierade modellen från
+`oak_d_sr_navigation`: en färsk `0x92`-baslinje följs av `0xA4` absoluta
+motorlägen. Hjulomkretsarna är `0,805 m`, spårvidden `1,005 m` och 8:1-
+utväxlingen samt motorernas fysiska tecken appliceras exakt en gång i
+CAN-workern. New-row skalar varje hjuls A4-hastighet efter dess vinkelmål.
 
-En jämförelse med den tidigare verifierade implementationen i
-`oak_d_sr_navigation` visar en väsentlig skillnad: den använder en engångs,
-encoder-målsatt RMD-X6-positionering med `0xA4`, medan `field_control` i dag
-styr samma vändning med återkommande hastighetskommandon `0xA2` och verifierar
-encodersträcka samt IMU-heading. Protokolldokumentationen bekräftar `0xA4` som
-absolut fler-varvs-positionering med 0,01°-mål och en separat
-hastighetsgräns. Nästa steg är att utforma en minimal, granskningsbar
-integration av den verifierade `0xA4`-principen genom den enda CAN-workern;
-den får inte kringgå control lease, watchdog, STOP eller CAN-arbitrering.
+CAN-workern håller minst 1,5 ms mellan motorernas A4-kommandon, bekräftar mål
+med begränsade 0x92-avläsningar och STOP kan avbryta en aktiv positionering.
+Målbekräftelse uppdaterar därefter rad-heading med +180° utan att vänta på
+IMU, så den redan verifierade heading-/visionsregleringen får överta.
 
-Det återstår därefter en ny uttryckligt godkänd raised-wheel HIL-körning som
-bekräftar faktisk motriktad rörelse, riktningstecken och fail-closed STOP
+Automatiserade mockade tester täcker A4-mål, hastighetsförhållande,
+workertrådens 1,5 ms-lucka, STOP-preemption, timeout och båda runtime-
+turnvägarna. Det återstår en ny uttryckligt godkänd raised-wheel HIL-körning
+för att bekräfta faktisk fysisk riktning, positionering och fail-closed STOP
 innan någon 180°-kalibrering eller marktest görs.
 
 CAN och motorer ska inte anslutas för normal testkörning. Följande kräver

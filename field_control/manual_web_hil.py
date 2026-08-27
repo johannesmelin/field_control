@@ -238,7 +238,7 @@ def run_manual_web_forward(request: ManualWebForwardRequest) -> ManualWebForward
             if status.fault is not None and not status.motor_output_armed:
                 if status.fault != CONTROL_LEASE_EXPIRED:
                     raise RuntimeError(f"oväntat manual-web-fel: {status.fault}")
-                command = status.last_command
+                command = status.last_admitted_nonzero_command
                 if command is None or (command.left_rpm, command.right_rpm) != (MANUAL_FORWARD_RPM, MANUAL_FORWARD_RPM):
                     raise RuntimeError("webb-forward gav inte exakt väntat motor-side kommando")
                 result = ManualWebForwardResult(
@@ -333,7 +333,7 @@ def run_manual_web_reverse(request: ManualWebForwardRequest) -> ManualWebReverse
             deadline_reached.wait(MANUAL_REVERSE_REFRESH_S)
         if deadline_error:
             raise RuntimeError(f"webb-back STOP misslyckades: {type(deadline_error[0]).__name__}: {deadline_error[0]}")
-        command = runtime.status().last_command
+        command = runtime.status().last_admitted_nonzero_command
         if command is None or (command.left_rpm, command.right_rpm) != (-MANUAL_REVERSE_RPM, -MANUAL_REVERSE_RPM):
             raise RuntimeError("webb-back gav inte exakt väntat motor-side kommando")
         status = runtime.status()
@@ -427,7 +427,7 @@ def run_manual_web_left(request: ManualWebForwardRequest) -> ManualWebLeftResult
         if deadline_error:
             detail = deadline_error[0]
             raise RuntimeError(f"webb-vänster STOP misslyckades: {type(detail).__name__}: {detail}")
-        command = runtime.status().last_command
+        command = runtime.status().last_admitted_nonzero_command
         expected = (-MANUAL_LEFT_RPM, MANUAL_LEFT_RPM)
         if command is None or (command.left_rpm, command.right_rpm) != expected:
             raise RuntimeError("webb-vänster gav inte exakt väntat motor-side kommando")
@@ -521,7 +521,7 @@ def run_manual_web_right(request: ManualWebForwardRequest) -> ManualWebRightResu
         if deadline_error:
             detail = deadline_error[0]
             raise RuntimeError(f"webb-höger STOP misslyckades: {type(detail).__name__}: {detail}")
-        command = runtime.status().last_command
+        command = runtime.status().last_admitted_nonzero_command
         expected = (MANUAL_RIGHT_RPM, -MANUAL_RIGHT_RPM)
         if command is None or (command.left_rpm, command.right_rpm) != expected:
             raise RuntimeError("webb-höger gav inte exakt väntat motor-side kommando")
@@ -612,7 +612,7 @@ def run_manual_web_stop(request: ManualWebForwardRequest) -> ManualWebStopResult
         if status.motor_output_armed or status.fault is not None:
             raise RuntimeError("webb-STOP lämnade motorutgång armerad eller runtime felad")
         expected = (MANUAL_STOP_RPM, MANUAL_STOP_RPM)
-        command = status.last_command
+        command = status.last_admitted_nonzero_command
         if command is None or (command.left_rpm, command.right_rpm) != expected:
             raise RuntimeError("webb-STOP-test saknar bevis på föregående aktivt motor-side kommando")
         result = ManualWebStopResult(

@@ -179,6 +179,20 @@ class FieldStateMachine:
             "Vändning klar",
         )
 
+    def turn_transition_due(self, observation: Observation) -> bool:
+        """Whether this exact observation will enter an automatic turn.
+
+        Runtime uses this narrowly to hand a confirmed physical marker to the
+        sole A4 worker before applying the ordinary stale-source gate.  It is
+        intentionally a pure preview of the marker branch in :meth:`tick`;
+        it does not mutate debounce state or relax any other sensor rule.
+        """
+        return (self.state in self._ACTIVE
+                and self.state not in (State.AUTO_IN_ROW_TURN, State.AUTO_NEW_ROW_TURN)
+                and self._marker_armed
+                and observation.marker_seen
+                and self._marker_frames + 1 >= self.config.turn_marker_confirm_frames)
+
     def tick(self, observation: Observation) -> Snapshot:
         if not math.isfinite(observation.now_s) or not math.isfinite(observation.distance_m):
             self._fault("INVALID_SENSOR_VALUE")

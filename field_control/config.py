@@ -13,6 +13,12 @@ from .state_machine import SafetyConfig
 from .odometry import DriveGeometry
 
 
+# A position-target turn must be given enough time to traverse the largest
+# wheel target at the commanded *motor-side* RPM.  Keep the bounded CAN/setup
+# allowance explicit and shared by every physical deployment configuration.
+A4_POSITION_TURN_TIMEOUT_MARGIN_S = 10.0
+
+
 @dataclass(frozen=True)
 class Zone:
     x_min: float; x_max: float; y_min: float; y_max: float
@@ -88,6 +94,12 @@ class PhysicalCanConfig:
     slcan_device: str | None = None
     confirm_physical_stop_tested: bool = False
     confirm_wheels_raised: bool = False
+    # Ground-output is intentionally a separate, fully explicit operating
+    # context.  These trailing defaults preserve existing positional callers
+    # for the raised-wheel HIL profile.
+    confirm_ground_test: bool = False
+    confirm_ground_clear: bool = False
+    confirm_emergency_stop_ready: bool = False
 
     def validate(self) -> "PhysicalCanConfig":
         if not isinstance(self.enabled, bool):
@@ -107,8 +119,19 @@ class PhysicalCanConfig:
             raise ValueError("fysisk output kräver stabil /dev/serial/by-id/-sökväg")
         if self.confirm_physical_stop_tested is not True:
             raise ValueError("explicit bekräftelse av fysiskt STOP-test krävs")
-        if self.confirm_wheels_raised is not True:
-            raise ValueError("explicit bekräftelse att hjulen är upphissade krävs")
+        raised = self.confirm_wheels_raised is True
+        ground = (self.confirm_ground_test is True
+                  and self.confirm_ground_clear is True
+                  and self.confirm_emergency_stop_ready is True)
+        any_ground = any((self.confirm_ground_test, self.confirm_ground_clear,
+                          self.confirm_emergency_stop_ready))
+        if raised:
+            if any_ground:
+                raise ValueError("fysisk CAN-output kräver exakt ett testläge: upphissade hjul eller fullständigt marktest")
+        elif not ground:
+            if any_ground:
+                raise ValueError("marktest kräver --confirm-ground-test, fri yta och nödstopp")
+            raise ValueError("explicit bekräftelse att hjulen är upphissade eller fullständigt marktest krävs")
         return self
 
 
@@ -125,6 +148,10 @@ class RuntimeConfig:
     control_lease_timeout_s: float = .3
     watchdog_period_s: float = .02
     max_control_stall_s: float = .12
+    # A physical-web standby has no active control lease and never permits
+    # output.  It only gives an operator time to move from local CLI arming
+    # to the loopback dashboard before a fresh normal lease is claimed.
+    physical_web_standby_timeout_s: float = 30.0
     physical_can: PhysicalCanConfig = PhysicalCanConfig()
     odometry_geometry: DriveGeometry = DriveGeometry()
     row_spacing_m: float = 1.2
@@ -151,6 +178,47 @@ class RuntimeConfig:
     max_heading_correction_rpm: float = 0.0
     log_level: str = "INFO"
 
+    def minimum_physical_a4_turn_timeout_s(self) -> float | None:
+        """Return the fail-safe deadline needed by enabled physical A4 turns.
+
+        The verified A4 path commands motor-shaft angle while its configured
+        speed is motor-side RPM.  Therefore a logical wheel target of ``D``
+        degrees takes ``D * gear / (RPM * 6)`` seconds.  Only turn manoeuvres
+        that this configuration can reach are included: an in-row turn needs
+        ``in_row_turn_enabled`` and a new-row turn needs more than one row.
+        ``None`` means this configuration cannot enter an automatic turn.
+        """
+        if not self.physical_can.enabled:
+            return None
+
+        target_degrees: list[float] = []
+        geometry = self.odometry_geometry
+        if self.safety.in_row_turn_enabled:
+            target_degrees.append(float(self.safety.in_row_turn_wheel_degrees))
+        if self.safety.number_of_rows > 1:
+            inner_distance_m = math.pi * (self.row_spacing_m - geometry.wheel_track_m) / 2.0
+            outer_distance_m = math.pi * (self.row_spacing_m + geometry.wheel_track_m) / 2.0
+            if self.safety.new_row_turn_direction == "left":
+                target_degrees.extend((
+                    inner_distance_m / geometry.left_wheel_circumference_m * 360.0,
+                    outer_distance_m / geometry.right_wheel_circumference_m * 360.0,
+                ))
+            else:
+                target_degrees.extend((
+                    outer_distance_m / geometry.left_wheel_circumference_m * 360.0,
+                    inner_distance_m / geometry.right_wheel_circumference_m * 360.0,
+                ))
+        if not target_degrees:
+            return None
+
+        motor_rpm = min(float(self.turn_speed_rpm), float(self.max_rpm))
+        if motor_rpm <= 0:
+            raise ValueError("turn_speed_rpm och max_rpm måste vara positiva för fysisk A4-vändning")
+        largest_wheel_degrees = max(abs(value) for value in target_degrees)
+        nominal_s = (largest_wheel_degrees * geometry.motor_turns_per_wheel_turn
+                     / (motor_rpm * 6.0))
+        return nominal_s + A4_POSITION_TURN_TIMEOUT_MARGIN_S
+
     def validate(self) -> "RuntimeConfig":
         self.vision.validate(); self.safety.validate(); self.odometry_geometry.validate(); self.physical_can.validate()
         if not 0 < self.heading_filter_alpha <= 1:
@@ -159,7 +227,8 @@ class RuntimeConfig:
             raise ValueError("headingreferensens sträckor är ogiltiga")
         if self.row_spacing_m <= self.odometry_geometry.wheel_track_m:
             raise ValueError("row_spacing_m måste vara större än wheel_track_m")
-        timeouts = (self.camera_timeout_s, self.imu_timeout_s, self.odometry_timeout_s, self.control_lease_timeout_s)
+        timeouts = (self.camera_timeout_s, self.imu_timeout_s, self.odometry_timeout_s,
+                    self.control_lease_timeout_s, self.physical_web_standby_timeout_s)
         if any(value <= 0 for value in timeouts):
             raise ValueError("sensortimeout måste vara positiv")
         if not 0 < self.watchdog_period_s <= .020:
@@ -168,6 +237,8 @@ class RuntimeConfig:
             raise ValueError("maximal styrloopstall måste vara positiv och högst 120 ms")
         if self.control_lease_timeout_s > .300:
             raise ValueError("control-lease-timeout får vara högst 300 ms")
+        if self.physical_web_standby_timeout_s > 60.0:
+            raise ValueError("fysisk webb-standby får vara högst 60 s")
         dimensions = (self.processing_width, self.processing_height, self.stream_width, self.stream_height)
         if any(value < 1 for value in dimensions) or self.jpeg_quality not in range(1, 101):
             raise ValueError("bilddimensioner och JPEG-kvalitet är ogiltiga")
@@ -185,4 +256,11 @@ class RuntimeConfig:
             raise ValueError("styrparametrar får inte vara negativa")
         if self.physical_can.enabled and self.max_rpm <= 0:
             raise ValueError("max_rpm måste vara positiv när fysisk CAN-output aktiveras")
+        minimum_turn_timeout_s = self.minimum_physical_a4_turn_timeout_s()
+        if (minimum_turn_timeout_s is not None
+                and self.safety.turn_timeout_s < minimum_turn_timeout_s):
+            raise ValueError(
+                "turn_timeout_s är för kort för fysisk A4-vändning: "
+                f"minst {minimum_turn_timeout_s:.3f} s krävs för mål, utväxling, motor-RPM och 10 s marginal"
+            )
         return self

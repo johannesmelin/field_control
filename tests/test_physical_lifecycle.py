@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import inspect
 import sys
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -11,7 +12,9 @@ from unittest.mock import patch
 from field_control.app import FieldControlApplication
 from field_control.config import PhysicalCanConfig, RuntimeConfig
 from field_control.sources import LatestValue
-from field_control.verified_motor_boundary import open_verified_boundary
+from field_control.verified_motor_boundary import _VerifiedPhysicalMotorBoundary, open_verified_boundary
+from field_control.lease import ControlLease
+from field_control.control import WheelCommand
 
 
 class Sink:
@@ -37,6 +40,43 @@ def deployment_config(max_rpm=20.0):
 
 
 class VerifiedDeploymentTests(unittest.TestCase):
+    def test_web_standby_releases_drive_lease_and_claims_a_fresh_one(self):
+        sink = Sink()
+        lease = ControlLease(timeout_s=.3)
+        boundary = _VerifiedPhysicalMotorBoundary(sink, lease, max_rpm=20)
+        first = lease.acquire(); boundary.arm(first)
+        boundary.enter_web_standby(first)
+        self.assertTrue(boundary.armed)
+        self.assertTrue(boundary.web_standby_active)
+        self.assertFalse(lease.valid(first))
+
+        with self.assertRaises(Exception):
+            boundary.command(WheelCommand(1, 1, "must-not-drive"), first)
+        self.assertFalse(boundary.web_standby_active)
+        self.assertFalse(boundary.armed)
+
+        # A new handoff can only drive after a fresh ordinary lease claim.
+        second = lease.acquire(); boundary.arm(second); boundary.enter_web_standby(second)
+        fresh = lease.acquire(); boundary.claim_web_standby(fresh)
+        boundary.command(WheelCommand(1, -1, "claimed"), fresh)
+        self.assertFalse(boundary.web_standby_active)
+
+    def test_stop_wins_over_web_standby_claim_race(self):
+        sink = Sink(); lease = ControlLease(timeout_s=.3)
+        boundary = _VerifiedPhysicalMotorBoundary(sink, lease, max_rpm=20)
+        first = lease.acquire(); boundary.arm(first); boundary.enter_web_standby(first)
+        fresh = lease.acquire(); errors = []
+        claim = threading.Thread(target=lambda: self._capture(lambda: boundary.claim_web_standby(fresh), errors))
+        claim.start(); boundary.stop_all("operator STOP"); claim.join(.3)
+        self.assertFalse(claim.is_alive())
+        self.assertFalse(boundary.armed)
+        self.assertFalse(boundary.web_standby_active)
+        self.assertTrue(not errors or isinstance(errors[0], Exception))
+
+    @staticmethod
+    def _capture(callback, errors):
+        try: callback()
+        except Exception as exc: errors.append(exc)
     def test_app_start_failure_closes_verified_output_once(self):
         class PassiveSource:
             def __init__(self, *_args): self.latest = LatestValue()

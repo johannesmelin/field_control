@@ -26,6 +26,32 @@ class DifferentialTurnPlan:
     direction: Literal["left", "right"]
 
 
+@dataclass(frozen=True)
+class AbsolutePositionTurn:
+    """Wheel-angle increments for an encoder-targeted differential turn.
+
+    Values are logical wheel degrees.  The verified CAN boundary converts
+    them to motor-shaft angles using ``DriveGeometry`` and applies hardware
+    signs once, after it has read fresh 0x92 starting angles.
+    """
+    left_wheel_degrees: float
+    right_wheel_degrees: float
+    direction: Literal["left", "right"]
+
+
+def absolute_position_turn(plan: DifferentialTurnPlan, geometry: DriveGeometry) -> AbsolutePositionTurn:
+    """Convert geometry-derived signed travel to exact logical wheel angles."""
+    geometry.validate()
+    values = (plan.left_distance_m, plan.right_distance_m)
+    if not all(math.isfinite(value) and value != 0 for value in values):
+        raise ValueError("turn-plan targets måste vara ändliga och icke-noll")
+    return AbsolutePositionTurn(
+        left_wheel_degrees=plan.left_distance_m / geometry.left_wheel_circumference_m * 360.0,
+        right_wheel_degrees=plan.right_distance_m / geometry.right_wheel_circumference_m * 360.0,
+        direction=plan.direction,
+    )
+
+
 def _ratios(left_wheel_turns: float, right_wheel_turns: float) -> tuple[float, float]:
     """Normalize signed wheel turns; motor-side common 8:1 cancels out."""
     maximum = max(abs(left_wheel_turns), abs(right_wheel_turns))

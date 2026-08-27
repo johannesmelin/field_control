@@ -66,6 +66,32 @@ class ConfigIoTests(unittest.TestCase):
                 physical["slcan_device"] = path
                 with self.assertRaises(ValueError): runtime_config_from_dict(document)
 
+    def test_ground_context_booleans_are_strict_default_false_and_round_trip(self):
+        # Old documents omit these trailing fields and retain the disabled,
+        # safe defaults rather than being interpreted as a ground deployment.
+        legacy = {"physical_can": {"enabled": False}}
+        parsed = runtime_config_from_dict(legacy)
+        self.assertFalse(parsed.physical_can.confirm_ground_test)
+        self.assertFalse(parsed.physical_can.confirm_ground_clear)
+        self.assertFalse(parsed.physical_can.confirm_emergency_stop_ready)
+
+        document = runtime_config_to_dict(RuntimeConfig())
+        physical = document["physical_can"]
+        physical.update({
+            "enabled": True, "channel": "can0", "reply_profile": "observed-rmdx-same-id",
+            "slcan_device": "/dev/serial/by-id/usb-CANable_123",
+            "confirm_physical_stop_tested": True,
+            "confirm_ground_test": True, "confirm_ground_clear": True,
+            "confirm_emergency_stop_ready": True,
+        })
+        document["max_rpm"] = 1.0
+        self.assertTrue(runtime_config_from_dict(document).physical_can.confirm_ground_test)
+        for field in ("confirm_ground_test", "confirm_ground_clear", "confirm_emergency_stop_ready"):
+            invalid = runtime_config_to_dict(RuntimeConfig())
+            invalid["physical_can"][field] = "true"
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "boolesk"):
+                runtime_config_from_dict(invalid)
+
     def test_imu_rate_is_validated_and_wired_to_combined_oak_backend(self):
         with self.assertRaises(ValueError): RuntimeConfig(imu_sample_hz=True).validate()
         with self.assertRaises(ValueError): RuntimeConfig(imu_sample_hz=0).validate()

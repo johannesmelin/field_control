@@ -2,7 +2,7 @@ import unittest
 
 from field_control.odometry import DriveGeometry
 from field_control.state_machine import SafetyConfig
-from field_control.turn import DifferentialTurnPlan, in_row_turn_plan, new_row_turn_targets
+from field_control.turn import DifferentialTurnPlan, absolute_position_turn, in_row_turn_plan, new_row_turn_targets
 from field_control.turn_controller import TurnController, TurnObservation
 
 
@@ -34,6 +34,14 @@ class TurnFoundationTests(unittest.TestCase):
         self.assertEqual((plan.left_ratio, plan.right_ratio),
                          (new_row_turn_targets(other_gear_ratio, 2, 20, "right", .1).left_ratio,
                           new_row_turn_targets(other_gear_ratio, 2, 20, "right", .1).right_ratio))
+
+    def test_absolute_position_targets_are_logical_wheel_degrees_not_motor_signed(self):
+        geometry = DriveGeometry(left_wheel_circumference_m=.805, right_wheel_circumference_m=.805,
+                                 wheel_track_m=1.005, motor_turns_per_wheel_turn=8,
+                                 left_forward_sign=1, right_forward_sign=-1)
+        plan = in_row_turn_plan(geometry, 720, "left")
+        target = absolute_position_turn(plan, geometry)
+        self.assertEqual((target.left_wheel_degrees, target.right_wheel_degrees), (-720, 720))
 
     def controller(self, **changes):
         plan = in_row_turn_plan(DriveGeometry(left_wheel_circumference_m=1, right_wheel_circumference_m=1), 720, "left")

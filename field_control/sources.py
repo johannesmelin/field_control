@@ -79,6 +79,7 @@ class ImuBackend(Protocol):
 
 class EncoderBackend(Protocol):
     def angles(self) -> tuple[float, float]: ...
+    def angles_with_timestamp(self) -> tuple[tuple[float, float], float]: ...
     def close(self) -> None: ...
 
 
@@ -151,6 +152,23 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
         self._backend = backend
         self._geometry = geometry.validate()
         self._initial: tuple[float, float] | None = None
+        self._sample_acquired_at_s: float | None = None
+        # A STOP-preempted 0x92 request has no usable relation to the cached
+        # sample that preceded it.  Until a later read succeeds, consumers
+        # must see the source as unavailable rather than silently retaining
+        # that old value for arming or physical freshness checks.
+        self._fresh_read_required = threading.Event()
+        # A mode-change STOP must be ordered before the next encoder request.
+        # This gate rejects an in-flight pre-STOP result and prevents a new
+        # 0x92 pair from being admitted in the small interval before STOP has
+        # reached the shared CAN worker.
+        self._stop_recovery_generation = 0
+        self._stop_recovery_read_permitted = True
+        # MANUAL physical control owns the shared CAN worker for held A2
+        # commands.  This acknowledgement is stronger than merely ignoring a
+        # stale snapshot: once paused, no 0x92 read is active or can begin.
+        self._manual_paused = False
+        self._read_in_progress = False
         # Arming a physical boundary must wait for an actual encoder sample,
         # not merely for this source thread to have been started.  This is a
         # condition rather than a polling delay so the first publish, a read
@@ -159,29 +177,143 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
         super().__init__(self._read_sample, "field-odometry")
 
     def _read_sample(self) -> OdometrySample:
-        angles = self._backend.angles()
+        timestamp_reader = getattr(self._backend, "angles_with_timestamp", None)
+        if callable(timestamp_reader):
+            angles, acquired_at_s = timestamp_reader()
+            if (not isinstance(acquired_at_s, (int, float)) or isinstance(acquired_at_s, bool)
+                    or not math.isfinite(acquired_at_s) or acquired_at_s < 0):
+                raise ValueError("encoderkälla saknar giltig förvärvstid")
+            self._sample_acquired_at_s = float(acquired_at_s)
+        else:
+            angles = self._backend.angles()
+            self._sample_acquired_at_s = time.monotonic()
         if self._initial is None:
             self._initial = angles
         return from_motor_angles(*self._initial, *angles, self._geometry)
 
     def snapshot(self) -> SourceSnapshot[OdometrySample]:
         """Return one immutable, timestamped latest sample without queueing."""
-        return self.latest.snapshot()
+        snapshot = self.latest.snapshot()
+        if self._fresh_read_required.is_set():
+            # This is a transient scheduling state, not a terminal sensor
+            # error.  Keep ``error`` clear so wait_until_ready() waits for the
+            # next fresh 0x92 pair instead of reporting a false hard failure.
+            return SourceSnapshot(None, None, False)
+        return snapshot
 
     def _run(self) -> None:
         """Publish at a bounded rate; never turn a latest-value source into a CAN queue."""
         try:
             while not self._stop.is_set():
-                self.latest.publish(self._read())
+                try:
+                    with self._readiness:
+                        while ((not self._stop_recovery_read_permitted or self._manual_paused)
+                               and not self._stop.is_set()):
+                            self._readiness.wait()
+                        if self._stop.is_set():
+                            break
+                        recovery_generation = self._stop_recovery_generation
+                        self._read_in_progress = True
+                    try:
+                        sample = self._read()
+                    finally:
+                        with self._readiness:
+                            self._read_in_progress = False
+                            self._readiness.notify_all()
+                except EncoderReadPreempted:
+                    # A typed worker signal means an intentional STOP/restart
+                    # won arbitration over this *unstarted* 0x92 pair.  It is
+                    # neither a CAN reply nor an encoder value and must never
+                    # be published as a fresh sample.  Wait through the normal
+                    # sampling boundary, then request a completely new pair.
+                    # Any other error remains terminal below; shutdown wins
+                    # over recovery because Event.wait() returns immediately.
+                    self._fresh_read_required.set()
+                    with self._readiness:
+                        self._readiness.notify_all()
+                    if self._stop.wait(self.SAMPLE_PERIOD_S):
+                        break
+                    continue
+                with self._readiness:
+                    # A result that began before the AUTO STOP barrier is
+                    # deliberately discarded.  It cannot authorize arming or
+                    # AUTO motion after that STOP.
+                    if recovery_generation != self._stop_recovery_generation:
+                        continue
+                # A cached A4 sample keeps its original acquisition time; do
+                # not make it appear fresh merely because this source polled.
+                self.latest.publish(sample, self._sample_acquired_at_s)
+                self._fresh_read_required.clear()
                 with self._readiness:
                     self._readiness.notify_all()
                 self._stop.wait(self.SAMPLE_PERIOD_S)
         except Exception as exc:
             if not self._stop.is_set():
+                # A real later failure must never be hidden behind the
+                # transient preemption state.
+                self._fresh_read_required.clear()
                 self.latest.fail(f"{type(exc).__name__}: {exc}")
         finally:
             with self._readiness:
                 self._readiness.notify_all()
+
+    def begin_stop_recovery(self) -> None:
+        """Invalidate encoder data and hold later reads until STOP is queued.
+
+        The runtime pairs this with :meth:`finish_stop_recovery` around its
+        nonblocking verified STOP admission.  It is intentionally not a
+        generic error state: a later fresh read is required, while real read
+        errors remain terminal in :meth:`_run`.
+        """
+        with self._readiness:
+            self._fresh_read_required.set()
+            self._stop_recovery_generation += 1
+            self._stop_recovery_read_permitted = False
+            self._readiness.notify_all()
+
+    def finish_stop_recovery(self) -> None:
+        """Allow the first encoder request strictly after a queued STOP."""
+        with self._readiness:
+            self._stop_recovery_read_permitted = True
+            self._readiness.notify_all()
+
+    @property
+    def manual_paused(self) -> bool:
+        """Whether MANUAL owns a quiescent encoder source."""
+        with self._readiness:
+            return self._manual_paused
+
+    def pause_for_manual(self, timeout_s: float) -> bool:
+        """Fence and acknowledge the absence of active/future 0x92 reads.
+
+        The caller must have admitted its preceding STOP before invoking this
+        method.  The bounded acknowledgement waits only for a currently
+        admitted backend call; its result is discarded by the generation
+        fence and no later call can start while paused.
+        """
+        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool)
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("odometrins paus-timeout måste vara positiv")
+        deadline = time.monotonic() + float(timeout_s)
+        with self._readiness:
+            self._fresh_read_required.set()
+            self._stop_recovery_generation += 1
+            self._manual_paused = True
+            self._readiness.notify_all()
+            while self._read_in_progress and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Keep the source paused even on timeout.  The runtime
+                    # must fail closed instead of admitting MANUAL movement.
+                    return False
+                self._readiness.wait(remaining)
+            return not self._stop.is_set()
+
+    def resume_from_manual(self) -> None:
+        """Permit the fenced post-STOP read needed before AUTO admission."""
+        with self._readiness:
+            self._manual_paused = False
+            self._readiness.notify_all()
 
     def wait_until_ready(self, timeout_s: float) -> bool:
         """Wait boundedly for the first valid sample or a terminal source state.
@@ -220,6 +352,7 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
         # Wake an arming waiter before closing a possibly blocking backend.
         self._stop.set()
         with self._readiness:
+            self._stop_recovery_read_permitted = True
             self._readiness.notify_all()
         begin_shutdown = getattr(self._backend, "begin_shutdown", None)
         if callable(begin_shutdown):

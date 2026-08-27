@@ -1,11 +1,12 @@
 import unittest
 import threading
 import time
+import io
 
 from field_control.config import PhysicalCanConfig, RuntimeConfig
 from field_control.control import WheelCommand
 from field_control.heading import RowHeadingReference
-from field_control.observation import (HeadingProcessor, ImuReading, build_observation,
+from field_control.observation import (HeadingProcessor, ImuReading, Observation, build_observation,
                                        forward_distance_from_odometry)
 from field_control.sources import LatestValue
 from field_control.sources import heading_from_imu_quaternion
@@ -13,8 +14,10 @@ from field_control.sources import OdometrySource
 from field_control.odometry import DriveGeometry, OdometrySample
 from field_control.turn import new_row_turn_plan
 from field_control.lease import ControlLease
-from field_control.runtime import FieldControlRuntime
+from field_control.runtime import FieldControlRuntime, _Lifecycle
 from field_control.state_machine import State
+from field_control.web import DiagnosticsServer
+from unittest.mock import patch
 
 
 class RuntimeIntegrationTests(unittest.TestCase):
@@ -26,6 +29,103 @@ class RuntimeIntegrationTests(unittest.TestCase):
             physical_can=PhysicalCanConfig(True, "can0", "observed-rmdx-same-id",
                                             "/dev/serial/by-id/test", True, True),
         )
+
+    def test_stationary_auto_hold_is_idempotent_without_masking_stop_or_motion(self):
+        """AUTO_PICK must not repeatedly preempt the shared encoder worker."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self):
+                self.armed = True
+                self.holds = []
+                self.stops = []
+                self.commands = []
+            def arm(self, _token): self.armed = True
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason):
+                self.stops.append(reason)
+                self.armed = False
+            def command(self, command, _token): self.commands.append(command)
+
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        stationary = Observation(0.0, None, None, None, False, None, None, None, 0.0,
+                                 True, True, True)
+
+        # Repeated 30 Hz AUTO_PICK ticks establish exactly one hold; each
+        # additional hold used to preempt a pending shared 0x92 read.
+        for _ in range(4):
+            runtime._dispatch_command(stationary, State.AUTO_PICK)
+        self.assertEqual(motor.holds, ["state AUTO_PICK"])
+        self.assertIsNone(runtime.status().last_command)
+
+        # A different stationary AUTO state establishes its own hold.
+        runtime._dispatch_command(stationary, State.AUTO_START_DELAY)
+        self.assertEqual(motor.holds, ["state AUTO_PICK", "state AUTO_START_DELAY"])
+
+        # An admitted nonzero command clears the marker, so returning to the
+        # same stopped state cannot accidentally suppress its safety hold.
+        vision = type("Vision", (), {
+            "target_x": 10.0,
+            "overlay": type("Overlay", (), {"shape": (20, 20)})(),
+        })()
+        following = Observation(0.0, vision, None, None, False, None, None, None, 0.0,
+                                True, True, True)
+        runtime._dispatch_command(following, State.AUTO_ROW_FOLLOW)
+        self.assertEqual(len(motor.commands), 1)
+        self.assertIsNotNone(runtime.status().last_command)
+        runtime._dispatch_command(stationary, State.AUTO_PICK)
+        self.assertEqual(motor.holds[-1], "state AUTO_PICK")
+        self.assertEqual(len(motor.holds), 3)
+        self.assertIsNone(runtime.status().last_command)
+
+        # Explicit STOP is never coalesced: it queues immediately, clears the
+        # marker and a later AUTO entry issues a new hold.
+        runtime.stop()
+        self.assertEqual(motor.stops, ["STOP"])
+        self.assertIsNone(runtime.status().last_command)
+        self.assertFalse(runtime.lease.valid(None))
+        runtime._dispatch_command(stationary, State.AUTO_PICK)
+        self.assertEqual(len(motor.holds), 4)
+
+    def test_stop_clears_live_command_but_retains_read_only_nonzero_admission_history(self):
+        """Historical HIL evidence cannot become an input to motor control."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self):
+                self.armed = True
+                self.commands = []
+                self.stops = []
+            def arm(self, _token): self.armed = True
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, reason):
+                self.stops.append(reason)
+                self.armed = False
+
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        command = WheelCommand(3.0, -2.0, "test")
+        runtime._admit_command(command)
+        self.assertEqual(runtime.status().last_command, command)
+        self.assertEqual(runtime.status().last_admitted_nonzero_command, command)
+
+        runtime.stop()
+
+        status = runtime.status()
+        self.assertIsNone(status.last_command)
+        self.assertEqual(status.last_admitted_nonzero_command, command)
+        self.assertFalse(status.motor_output_armed)
+        self.assertFalse(runtime.lease.valid(None))
+        self.assertEqual(motor.stops, ["STOP"])
 
     def test_physical_arm_waits_for_delayed_first_odometry_sample(self):
         class PassiveSource:
@@ -66,6 +166,686 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(motor.armed)
             self.assertEqual(motor.arm_calls, 1)
+        finally:
+            runtime.close()
+
+    def test_manual_arm_pauses_encoder_before_exposing_lease(self):
+        """MANUAL arm exposes no A2 lease until the 0x92 reader is quiescent."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self):
+                self.calls = 0
+                self.replacement_started = threading.Event()
+                self.release_replacement = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return 0.0, 0.0
+                self.replacement_started.set()
+                self.release_replacement.wait(.5)
+                return 0.0, 0.0
+            def close(self): self.release_replacement.set()
+
+        class Physical:
+            def __init__(self): self.armed = False; self.stops = []
+            def arm(self, _token): self.armed = True
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        backend = Angles(); motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(),
+                                      motor=motor, odometry=OdometrySource(backend, DriveGeometry()))
+        errors = []
+        runtime.start()
+        try:
+            # A prior navigation sample exists, but MANUAL must pause rather
+            # than schedule a replacement 0x92 around its verified arm STOP.
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            arm = threading.Thread(target=lambda: self._capture(runtime.arm_motor_output, errors))
+            arm.start()
+            arm.join(.5)
+            self.assertFalse(arm.is_alive())
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(runtime._lease_token)
+            self.assertTrue(runtime._odometry.manual_paused)
+            self.assertFalse(backend.replacement_started.is_set())
+            self.assertIsNone(runtime.status().fault)
+        finally:
+            runtime.close()
+
+    def test_manual_arm_does_not_charge_or_request_navigation_odometry(self):
+        """A long verified STOP settle does not start a MANUAL 0x92 read.
+
+        MANUAL uses the acknowledged pause rather than the AUTO recovery
+        fence, so its STOP settle cannot compete with an encoder request.
+        """
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self):
+                self.calls = 0
+                self.replacement_started = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return 0.0, 0.0
+                self.replacement_started.set()
+                time.sleep(.2)
+                return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = False; self.settle_started = threading.Event()
+            def arm(self, _token):
+                self.settle_started.set()
+                time.sleep(.35)
+                self.armed = True
+            def stop_all(self, _reason): self.armed = False
+
+        backend = Angles(); motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(odometry_timeout_s=.3), PassiveSource(), PassiveSource(),
+                                      motor=motor, odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            started = time.monotonic()
+            runtime.arm_motor_output()
+            elapsed = time.monotonic() - started
+            self.assertTrue(motor.settle_started.is_set())
+            self.assertFalse(backend.replacement_started.is_set())
+            self.assertGreater(elapsed, .3)
+            self.assertTrue(motor.armed)
+            self.assertIsNotNone(runtime._lease_token)
+            self.assertIsNone(runtime.status().fault)
+        finally:
+            runtime.close()
+
+    def test_manual_arm_accepts_without_post_settle_navigation_sample(self):
+        """MANUAL arming requires STOP+0x9C, not a post-stop 0x92 pair."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self):
+                self.calls = 0
+                self.replacement_started = threading.Event()
+                self.release = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return 0.0, 0.0
+                self.replacement_started.set()
+                self.release.wait(.5)
+                return 0.0, 0.0
+            def close(self): self.release.set()
+
+        class Physical:
+            def __init__(self): self.armed = False
+            def arm(self, _token):
+                time.sleep(.35)
+                self.armed = True
+            def stop_all(self, _reason): self.armed = False
+
+        backend = Angles(); motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(odometry_timeout_s=.2), PassiveSource(), PassiveSource(),
+                                      motor=motor, odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output()
+            self.assertFalse(backend.replacement_started.is_set())
+            self.assertIsNone(runtime.status().fault)
+            self.assertTrue(motor.armed)
+            self.assertIsNotNone(runtime._lease_token)
+        finally:
+            runtime.close()
+
+    def test_start_auto_waits_for_post_stop_odometry_before_state_transition(self):
+        """Start Auto's own hold STOP cannot reuse the preceding 0x92 sample."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self):
+                self.calls = 0
+                self.replacement_started = threading.Event()
+                self.release_replacement = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return 0.0, 0.0
+                self.replacement_started.set()
+                self.release_replacement.wait(.5)
+                return 0.0, 0.0
+            def close(self): self.release_replacement.set()
+
+        class Physical:
+            def __init__(self): self.armed = True; self.holds = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        backend, motor = Angles(), Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime._lease_token = runtime.lease.acquire()
+            target = type("Vision", (), {
+                "target_x": 10.0,
+                "bud_in_trigger_zone": False,
+                "bud_in_pick_zone": False,
+                "marker_found": False,
+            })()
+            runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
+                                               True, True, True, OdometrySample(0, 0, 0, 0))
+            errors = []
+            starter = threading.Thread(target=lambda: self._capture(runtime.start_auto, errors))
+            starter.start()
+            self.assertTrue(backend.replacement_started.wait(.3))
+            self.assertTrue(starter.is_alive())
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            self.assertEqual(motor.holds, ["AUTO startförberedelse"])
+            self.assertIsNone(runtime.status().fault)
+
+            backend.release_replacement.set()
+            starter.join(.5)
+            self.assertFalse(starter.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
+            self.assertFalse(runtime._auto_start_odometry_recovery_pending)
+        finally:
+            runtime.close()
+
+    def test_locally_armed_physical_web_auto_then_start_preserves_arm_through_stop_barriers(self):
+        """Browser mode/start actions never arm, but may use a local arm.
+
+        Both mode selection and Start Auto queue a stopped physical hold and
+        require a replacement encoder sample.  The former must not turn a
+        locally acquired lease into browser-controlled arming.
+        """
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = False; self.holds = []; self.stops = []; self.arm_calls = 0
+            def arm(self, _token): self.arm_calls += 1; self.armed = True
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason): self.stops.append(reason); self.armed = False
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        def post(path: str) -> int:
+            with patch("field_control.web.status_payload", return_value={"ok": True}):
+                server = object.__new__(DiagnosticsServer); server.runtime = runtime
+                handler = object.__new__(server._handler())
+                result: list[int] = []; handler.path = path; handler.wfile = io.BytesIO()
+                handler.send_response = lambda status, *_args: result.append(status)
+                handler.send_header = lambda *_args: None; handler.end_headers = lambda: None
+                handler.send_error = lambda status, *_args: result.append(status)
+                handler.do_POST()
+                return result[0]
+
+        motor = Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(Angles(), DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output()
+            local_token = runtime._lease_token
+            self.assertTrue(motor.armed)
+            self.assertIsNotNone(local_token)
+            target = type("Vision", (), {
+                "target_x": 10.0, "bud_in_trigger_zone": False,
+                "bud_in_pick_zone": False, "marker_found": False,
+            })()
+            runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
+                                               True, True, True, OdometrySample(0, 0, 0, 0))
+
+            self.assertEqual(post("/api/auto"), 200)
+            self.assertTrue(motor.armed)
+            self.assertEqual(runtime._lease_token, local_token)
+            self.assertEqual(motor.holds, ["AUTO valt"])
+            self.assertEqual(motor.stops, [])
+            # The select-AUTO hold invalidates the preceding shared sample.
+            # The next web action is only admitted after its replacement.
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+
+            self.assertEqual(post("/api/start-auto"), 200)
+            self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
+            self.assertTrue(motor.armed)
+            self.assertEqual(runtime._lease_token, local_token)
+            self.assertEqual(motor.holds, ["AUTO valt", "AUTO startförberedelse"])
+            self.assertEqual(motor.stops, [])
+            # There is intentionally no HTTP route that could acquire arm.
+            self.assertEqual(post("/api/arm-motor-output"), 404)
+            self.assertEqual(motor.arm_calls, 1)
+        finally:
+            runtime.close()
+
+    def test_web_standby_has_no_drive_lease_until_start_auto_claims_it(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self):
+                self.armed = False; self.standby = False; self.holds = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): self.standby = True
+            def claim_web_standby(self, _token):
+                if not self.standby: raise RuntimeError("standby saknas")
+                self.standby = False
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason): self.standby = False; self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        motor = Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(Angles(), DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            self.assertTrue(motor.standby)
+            self.assertIsNone(runtime._lease_token)
+            self.assertEqual(motor.holds, [])
+            runtime.select_auto()
+            self.assertFalse(motor.standby)
+            self.assertFalse(motor.armed)
+            self.assertIsNone(runtime._lease_token)
+            self.assertEqual(motor.holds, [])
+            self.assertEqual(motor.stops, ["AUTO valt"])
+            target = type("Vision", (), {
+                "target_x": 10.0, "bud_in_trigger_zone": False,
+                "bud_in_pick_zone": False, "marker_found": False,
+            })()
+            runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
+                                               True, True, True, OdometrySample(0, 0, 0, 0))
+            with self.assertRaisesRegex(ValueError, "ny encoderavläsning"):
+                runtime.start_auto()
+            self.assertEqual(motor.stops, ["AUTO valt"])
+        finally:
+            runtime.close()
+
+    def test_paused_manual_source_stops_reads_and_accepts_held_command(self):
+        """A web MANUAL lease uses A2 while its 0x92 producer is quiescent."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self): self.calls = 0
+            def angles(self): self.calls += 1; return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = False; self.standby = False; self.commands = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): self.standby = True
+            def claim_web_standby(self, _token): self.standby = False
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, reason): self.armed = False; self.standby = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        backend, motor = Angles(), Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            paused_calls = backend.calls
+            time.sleep(.15)
+            self.assertEqual(backend.calls, paused_calls)
+            runtime.manual_command(WheelCommand(4, 4, "held-web"))
+            runtime.manual_command(WheelCommand(0, 0, "web-manual-hold"))
+            self.assertEqual([(item.left_rpm, item.right_rpm) for item in motor.commands], [(4, 4), (0, 0)])
+            self.assertTrue(motor.armed)
+            self.assertTrue(runtime.lease.valid(runtime._lease_token))
+            self.assertTrue(runtime._odometry.manual_paused)
+            runtime.stop()
+            self.assertEqual(motor.stops[-1], "STOP")
+        finally:
+            runtime.close()
+
+    def test_auto_selection_resumes_paused_source_and_requires_fresh_sample(self):
+        """AUTO resumes only behind its STOP fence; a missing pair faults closed."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self): self.calls = 0; self.second = threading.Event(); self.release = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls > 1:
+                    self.second.set(); self.release.wait(.5)
+                return 0.0, 0.0
+            def close(self): self.release.set()
+
+        class Physical:
+            def __init__(self): self.armed = False; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): pass
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        backend, motor = Angles(), Physical()
+        runtime = BlockingRuntime(self._physical_config(odometry_timeout_s=.05), PassiveSource(), PassiveSource(),
+                                  motor=motor, odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            runtime.select_auto()
+            self.assertTrue(backend.second.wait(.2))
+            self.assertFalse(runtime._odometry.manual_paused)
+            time.sleep(.07)
+            runtime.tick()
+            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            self.assertEqual(motor.stops[0], "AUTO valt")
+        finally:
+            backend.release.set()
+            runtime.close()
+
+    def test_failed_auto_hold_never_reopens_paused_encoder_source(self):
+        """A failed AUTO STOP leaves MANUAL's 0x92 pause acknowledged."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self): self.calls = 0; self.second_started = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls > 1: self.second_started.set()
+                return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = True; self.holds = 0; self.stops = []
+            def arm(self, _token): self.armed = True
+            def hold_stopped(self, _reason, _token):
+                self.holds += 1
+                raise RuntimeError("injected hold admission failure")
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        backend, motor = Angles(), Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            self.assertTrue(runtime._odometry.pause_for_manual(.2))
+            runtime._lease_token = runtime.lease.acquire()
+            with self.assertRaisesRegex(RuntimeError, "injected hold"):
+                runtime.select_auto()
+            time.sleep(.15)
+            self.assertTrue(runtime._odometry.manual_paused)
+            self.assertFalse(backend.second_started.is_set())
+            self.assertEqual(runtime.machine.state, State.FAULT)
+            self.assertTrue(motor.stops)
+        finally:
+            runtime.close()
+
+    def test_web_standby_handoff_gates_expired_drive_lease_until_no_motion_exchange(self):
+        """A watchdog waking during the handoff cannot preempt the 0x92 reader.
+
+        The simulated watchdog is deliberately invoked from
+        ``enter_web_standby`` after the ordinary arm lease has expired.  It
+        models the narrow race between ``arm_motor_output`` returning and the
+        standby exchange; no motor command is ever admitted in that interval.
+        """
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        now = [0.0]
+        lease = ControlLease(.05, clock=lambda: now[0])
+
+        class Physical:
+            control_lease = lease
+            def __init__(self): self.armed = False; self.standby = False; self.stops = []
+            @property
+            def fault_reason(self): return None
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token):
+                # The independent watchdog is now due, but it must remain
+                # gated until this no-motion exchange has completed.
+                now[0] = .10
+                runtime._watchdog_revoke_if_running("CONTROL_LEASE_EXPIRED")
+                self.standby = True
+            def claim_web_standby(self, _token): self.standby = False
+            def stop_all(self, reason):
+                self.armed = False; self.standby = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        motor = Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  clock=lambda: now[0], lease=lease)
+        runtime.start()
+        try:
+            runtime.arm_motor_output_for_web_standby()
+            # Also model a watchdog which observed non-standby just before
+            # publication, then won the lifecycle lock afterwards.
+            runtime._watchdog_revoke_if_running("CONTROL_LEASE_EXPIRED")
+            self.assertTrue(motor.armed)
+            self.assertTrue(motor.standby)
+            self.assertEqual(motor.stops, [])
+            self.assertIsNone(runtime._lease_token)
+            self.assertTrue(runtime.web_standby_status()[0])
+            self.assertIsNone(runtime.status().fault)
+        finally:
+            runtime.close()
+
+    def test_web_standby_handoff_failure_stops_and_clears_arming_gate(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = False; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): raise RuntimeError("standby exchange failed")
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        motor = Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor)
+        runtime.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "standby exchange failed"):
+                runtime.arm_motor_output_for_web_standby()
+            self.assertFalse(motor.armed)
+            self.assertEqual(motor.stops, ["fysisk webbstandby misslyckades"])
+            self.assertFalse(runtime._arming_in_progress)
+            self.assertIsNone(runtime._lease_token)
+            self.assertFalse(runtime.web_standby_status()[0])
+        finally:
+            runtime.close()
+
+    def test_web_standby_timeout_fails_closed_and_disarms(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = True; self.stops = []
+            def arm(self, _token): pass
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        now = [10.0]
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                      clock=lambda: now[0])
+        runtime._lifecycle = _Lifecycle.RUNNING
+        runtime._web_standby_deadline_s = 10.0
+        self.assertTrue(runtime._expire_web_standby_if_due(now[0]))
+        self.assertFalse(motor.armed)
+        self.assertEqual(motor.stops, ["WEB_STANDBY_TIMEOUT"])
+        self.assertEqual(runtime.status().fault, "WEB_STANDBY_TIMEOUT")
+        self.assertFalse(runtime.web_standby_status()[0])
+
+    def test_threaded_watchdog_keeps_valid_no_motion_web_standby_alive_until_its_deadline(self):
+        """Standby is not a stalled control loop or an expired drive lease."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        lease = ControlLease(.08)
+        class Physical:
+            control_lease = lease
+            def __init__(self): self.armed = False; self.standby = False; self.stops = []
+            @property
+            def fault_reason(self): return None
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, token):
+                self.assert_token = token; self.standby = lease.release(token)
+            def claim_web_standby(self, _token): self.standby = False
+            def stop_all(self, reason): self.armed = False; self.standby = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        config = self._physical_config(odometry_timeout_s=.3)
+        config = RuntimeConfig(**{**config.__dict__, "physical_web_standby_timeout_s": .45})
+        motor = Physical()
+        runtime = BlockingRuntime(config, PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(Angles(), DriveGeometry()), lease=lease)
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            self.assertTrue(runtime.web_standby_status()[0])
+            # This exceeds both the normal 80 ms drive lease and the 120 ms
+            # control-stall bound across several watchdog periods.
+            time.sleep(.20)
+            self.assertTrue(runtime.web_standby_status()[0])
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.stops, [])
+            self.assertIsNone(runtime.status().fault)
+            # Explicit STOP remains dominant while standby is alive.
+            runtime.stop()
+            self.assertFalse(runtime.web_standby_status()[0])
+            self.assertFalse(motor.armed)
+            self.assertEqual(motor.stops, ["STOP"])
+        finally:
+            runtime.close()
+
+    def test_stop_cancels_start_auto_waiting_for_post_stop_odometry(self):
+        """A delayed Start Auto caller cannot revive AUTO after operator STOP."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def __init__(self):
+                self.calls = 0
+                self.replacement_started = threading.Event()
+                self.release_replacement = threading.Event()
+            def angles(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return 0.0, 0.0
+                self.replacement_started.set()
+                self.release_replacement.wait(.5)
+                return 0.0, 0.0
+            def close(self): self.release_replacement.set()
+
+        class Physical:
+            def __init__(self): self.armed = True; self.holds = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        backend, motor = Angles(), Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(backend, DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime._lease_token = runtime.lease.acquire()
+            target = type("Vision", (), {
+                "target_x": 10.0,
+                "bud_in_trigger_zone": False,
+                "bud_in_pick_zone": False,
+                "marker_found": False,
+            })()
+            runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
+                                               True, True, True, OdometrySample(0, 0, 0, 0))
+            errors = []
+            starter = threading.Thread(target=lambda: self._capture(runtime.start_auto, errors))
+            starter.start()
+            self.assertTrue(backend.replacement_started.wait(.3))
+
+            runtime.stop()
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            backend.release_replacement.set()
+            starter.join(.5)
+
+            self.assertFalse(starter.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ValueError)
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            # Later control ticks must not resume the cancelled request.
+            runtime.tick()
+            self.assertEqual(runtime.machine.state, State.MANUAL)
         finally:
             runtime.close()
 
@@ -131,16 +911,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
         runtime.start()
         try:
             self.assertTrue(backend.read_started.wait(.2))
-            with self.assertRaisesRegex(ValueError, "odometri blev inte redo"):
+            with self.assertRaisesRegex(ValueError, "kunde inte pausas"):
                 runtime.arm_motor_output()
             self.assertFalse(motor.armed)
             self.assertEqual(motor.arm_calls, 0)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            self.assertEqual(runtime.status().fault, "ODOMETRY_PAUSE_TIMEOUT")
             self.assertTrue(motor.stops)
         finally:
             runtime.close()
 
-    def test_physical_arm_rejects_malformed_first_odometry_sample(self):
+    def test_manual_arm_does_not_require_a_navigation_sample(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -163,11 +943,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
                                   odometry=OdometrySource(MalformedAngles(), DriveGeometry()))
         runtime.start()
         try:
-            with self.assertRaisesRegex(ValueError, "odometri blev inte redo"):
-                runtime.arm_motor_output()
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            runtime.arm_motor_output()
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
+            self.assertTrue(runtime._odometry.manual_paused)
+            self.assertIsNone(runtime.status().fault)
         finally:
             runtime.close()
 
@@ -563,6 +1343,101 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse(observation.camera_fresh)
         self.assertIsNone(observation.vision)
         self.assertEqual(observation.fault, "CAMERA_TIMEOUT")
+
+    def test_backward_odometry_in_auto_pick_does_not_turn_valid_imu_into_timeout(self):
+        """A stationary marker/pick state does not collect row-heading samples."""
+        class Source:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+            def snapshot(self): return self.latest.snapshot()
+
+        now = [1.0]
+        camera, imu, odometry = Source(), Source(), Source()
+        camera.latest.publish(object(), now[0])
+        imu.latest.publish(ImuReading(10.0, now[0]), now[0])
+        odometry.latest.publish(1.0, now[0])
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False), camera, imu,
+                                      odometry=odometry, clock=lambda: now[0])
+        runtime._vision = type("Vision", (), {
+            "target_x": 160.0,
+            "bud_in_trigger_zone": False,
+            "bud_in_pick_zone": False,
+            "marker_found": False,
+            "overlay": type("Overlay", (), {"shape": (240, 320)})(),
+        })()
+        runtime._last_frame_timestamp = now[0]
+        runtime.machine.state = State.AUTO_PICK
+
+        runtime.tick()
+        now[0] = 1.1
+        imu.latest.publish(ImuReading(20.0, now[0]), now[0])
+        odometry.latest.publish(.99, now[0])
+        status = runtime.tick()
+
+        self.assertTrue(status.observation.imu_fresh)
+        self.assertIsNone(status.observation.imu_error)
+        self.assertNotEqual(status.snapshot.fault, "IMU_TIMEOUT")
+        self.assertIsNone(status.fault)
+        self.assertIsNone(runtime.heading.reference.reference_deg)
+        self.assertEqual(runtime.heading.reference.reliable_distance_m, 0.0)
+
+    def test_backward_odometry_in_auto_row_follow_remains_strict_reference_failure(self):
+        """Unexpected reverse progress is not silently hidden while following a row."""
+        class Source:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+            def snapshot(self): return self.latest.snapshot()
+
+        class Motor:
+            armed = False
+            def __init__(self): self.stops = []
+            def stop_all(self, reason): self.stops.append(reason)
+
+        now = [1.0]
+        camera, imu, odometry = Source(), Source(), Source()
+        camera.latest.publish(object(), now[0])
+        imu.latest.publish(ImuReading(10.0, now[0]), now[0])
+        odometry.latest.publish(1.0, now[0])
+        motor = Motor()
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False, max_rpm=10, auto_base_rpm=1), camera, imu,
+                                      motor=motor, odometry=odometry, clock=lambda: now[0])
+        runtime._vision = type("Vision", (), {
+            "target_x": 160.0,
+            "bud_in_trigger_zone": False,
+            "bud_in_pick_zone": False,
+            "marker_found": False,
+            "overlay": type("Overlay", (), {"shape": (240, 320)})(),
+        })()
+        runtime._last_frame_timestamp = now[0]
+        runtime.machine.state = State.AUTO_ROW_FOLLOW
+
+        runtime.tick()
+        self.assertEqual(runtime.heading.reference.reference_deg, 10.0)
+        self.assertEqual(runtime.machine.state, State.AUTO_ROW_FOLLOW, runtime.machine.reason)
+        now[0] = 1.1
+        imu.latest.publish(ImuReading(20.0, now[0]), now[0])
+        odometry.latest.publish(.99, now[0])
+        status = runtime.tick()
+
+        self.assertTrue(status.observation.imu_fresh)
+        self.assertIsNone(status.observation.imu_error)
+        self.assertEqual(status.observation.fault, "ROW_REFERENCE_ODOMETRY_NONMONOTONIC")
+        self.assertEqual(status.snapshot.fault, "ROW_REFERENCE_ODOMETRY_NONMONOTONIC")
+        self.assertEqual(status.fault, "ROW_REFERENCE_ODOMETRY_NONMONOTONIC")
+        self.assertEqual(motor.stops, ["ROW_REFERENCE_ODOMETRY_NONMONOTONIC"])
+
+    def test_actual_imu_source_failure_remains_imu_timeout(self):
+        camera = LatestValue(); camera.publish(object(), 1.0)
+        imu = LatestValue(); imu.fail("BNO086 lost")
+        odometry = LatestValue(); odometry.publish(1.0, 1.0)
+        observation = build_observation(
+            1.1, camera.snapshot(), imu.snapshot(), odometry.snapshot(), None,
+            HeadingProcessor(.5, RowHeadingReference(2.0, 1.0)), 1.0, 1.0, 1.0,
+        )
+        self.assertFalse(observation.imu_fresh)
+        self.assertEqual(observation.fault, "IMU_TIMEOUT")
 
     def test_runtime_configuration_rejects_nonpositive_sensor_timeout(self):
         with self.assertRaises(ValueError):

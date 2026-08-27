@@ -18,6 +18,7 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
     target_x = None if vision is None else vision.target_x
     x_goal_px = runtime.config.vision.x_goal * runtime.config.processing_width
     heading_error = None if heading is None or reference is None else (reference - heading + 180.0) % 360.0 - 180.0
+    standby_active, standby_deadline_s = runtime.web_standby_status()
     return {
         "running": status.running,
         "mode": status.mode,
@@ -54,10 +55,20 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
         "motor_fault_reason": getattr(runtime.motor, "fault_reason", None),
         "can": {"ok": getattr(runtime.motor, "fault_reason", None) is None},
         "control_lease": {"active": runtime.lease.valid(None), "watchdog_timeout_s": runtime.config.control_lease_timeout_s},
+        "physical_web_standby": {"active": standby_active, "deadline_monotonic_s": standby_deadline_s},
         "marker_armed": status.snapshot.marker_armed,
         "last_command": None if status.last_command is None else {
             "left_rpm": status.last_command.left_rpm, "right_rpm": status.last_command.right_rpm,
             "source": status.last_command.source,
         },
+        # Historical evidence only; it is never a live command and cannot
+        # renew a lease or re-arm motor output after STOP/fault/shutdown.
+        "last_admitted_nonzero_command": (
+            None if status.last_admitted_nonzero_command is None else {
+                "left_rpm": status.last_admitted_nonzero_command.left_rpm,
+                "right_rpm": status.last_admitted_nonzero_command.right_rpm,
+                "source": status.last_admitted_nonzero_command.source,
+            }
+        ),
         "recent_events": runtime.events.recent(),
     }

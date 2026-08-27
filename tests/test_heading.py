@@ -22,6 +22,19 @@ class HeadingTests(unittest.TestCase):
         self.assertEqual(reference.apply_successful_180_turn(), 225)
         self.assertTrue(reference.reliable)
 
+    def test_nonmonotonic_visual_odometry_remains_invalid(self):
+        reference = RowHeadingReference(window_m=2, minimum_distance_m=1)
+        reference.add_visual_heading(10, 1.0)
+        with self.assertRaisesRegex(ValueError, "odometristräckan får inte minska"):
+            reference.add_visual_heading(20, .99)
+
+    def test_invalid_heading_or_distance_still_fails_closed(self):
+        reference = RowHeadingReference(window_m=2, minimum_distance_m=1)
+        with self.assertRaises(ValueError):
+            reference.add_visual_heading(float("nan"), 1.0)
+        with self.assertRaises(ValueError):
+            reference.add_visual_heading(0.0, float("nan"))
+
 
 if __name__ == "__main__":
     unittest.main()

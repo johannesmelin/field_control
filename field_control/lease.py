@@ -90,6 +90,21 @@ class ControlLease:
         self._invoke_revoke(callback)
         return True
 
+    def release(self, token: str | None) -> bool:
+        """Relinquish one valid lease without invoking its output callback.
+
+        This is deliberately narrower than ``revoke_any``.  It exists solely
+        for the physical-web no-motion handoff: the verified boundary has
+        atomically changed to its separately bounded standby state before the
+        ordinary drive lease is released.  It must never be used to extend or
+        renew a drive lease.
+        """
+        with self._lock:
+            if token is None or token != self._token or self._expires_at is None:
+                return False
+            self._token = self._expires_at = None
+            return True
+
     def _revoke_locked(self) -> Callable[[], None] | None:
         self._token = self._expires_at = None
         return self._on_revoke

@@ -16,6 +16,10 @@ class FakeRuntime:
     def manual_command(self, command):
         if self.error is not None: raise self.error
         self.commands.append(command)
+    def select_manual(self): pass
+    def select_auto(self): pass
+    def start_auto(self): pass
+    def stop(self): pass
 
 
 class ManualWebTests(unittest.TestCase):
@@ -24,11 +28,28 @@ class ManualWebTests(unittest.TestCase):
             server = object.__new__(DiagnosticsServer); server.runtime = runtime
             handler = object.__new__(server._handler())
             response = []; handler.path = path; handler.wfile = io.BytesIO()
-            handler.send_response = lambda status: response.append(status)
+            handler.send_response = lambda status, *_args: response.append(status)
             handler.send_header = lambda *_args: None
             handler.end_headers = lambda: None
+            handler.send_error = lambda status, *_args: response.append(status)
             handler.do_POST()
-            return response[0], json.loads(handler.wfile.getvalue())
+            body = handler.wfile.getvalue()
+            return response[0], (json.loads(body) if body else None)
+
+    def test_dashboard_html_is_never_cached_across_server_restart(self):
+        runtime = FakeRuntime()
+        server = object.__new__(DiagnosticsServer); server.runtime = runtime
+        handler = object.__new__(server._handler())
+        response, headers = [], []
+        handler.path = "/"; handler.wfile = io.BytesIO()
+        handler.send_response = lambda status, *_args: response.append(status)
+        handler.send_header = lambda name, value: headers.append((name, value))
+        handler.end_headers = lambda: None
+        handler.do_GET()
+
+        self.assertEqual(response, [200])
+        self.assertIn(("Content-Type", "text/html; charset=utf-8"), headers)
+        self.assertIn(("Cache-Control", "no-store"), headers)
 
     def test_direction_routes_use_only_fixed_motor_side_manual_rpm(self):
         runtime = FakeRuntime(6.0)
@@ -43,6 +64,60 @@ class ManualWebTests(unittest.TestCase):
                 command = runtime.commands[-1]
                 self.assertEqual((command.left_rpm, command.right_rpm), values)
                 self.assertEqual(command.source, f"web-manual-{path.rsplit('/', 1)[-1]}")
+
+    def test_individual_and_both_wheel_routes_use_server_configured_rpm(self):
+        runtime = FakeRuntime(6.0)
+        expected = {
+            "/api/manual/left/forward": (6.0, 0.0, "left-forward"),
+            "/api/manual/left/reverse": (-6.0, 0.0, "left-reverse"),
+            "/api/manual/right/forward": (0.0, 6.0, "right-forward"),
+            "/api/manual/right/reverse": (0.0, -6.0, "right-reverse"),
+            "/api/manual/both/forward": (6.0, 6.0, "both-forward"),
+            "/api/manual/both/reverse": (-6.0, -6.0, "both-reverse"),
+        }
+        for path, values in expected.items():
+            with self.subTest(path=path):
+                status, body = self.request(runtime, path)
+                self.assertEqual((status, body), (200, {"ok": True}))
+                command = runtime.commands[-1]
+                self.assertEqual(
+                    (command.left_rpm, command.right_rpm, command.source),
+                    (values[0], values[1], f"web-manual-{values[2]}"),
+                )
+
+    def test_zero_hold_route_uses_the_same_manual_runtime_gate_without_client_rpm(self):
+        runtime = FakeRuntime(0.0)
+        status, body = self.request(runtime, "/api/manual/hold")
+        self.assertEqual((status, body), (200, {"ok": True}))
+        command = runtime.commands[-1]
+        self.assertEqual((command.left_rpm, command.right_rpm, command.source), (0.0, 0.0, "web-manual-hold"))
+
+    def test_dashboard_manual_controls_are_held_and_never_arm(self):
+        from field_control.web import DASHBOARD_HTML
+
+        for path in (
+            "/api/manual/left/forward", "/api/manual/left/reverse",
+            "/api/manual/right/forward", "/api/manual/right/reverse",
+            "/api/manual/both/forward", "/api/manual/both/reverse",
+        ):
+            self.assertIn(f'data-manual-path="{path}"', DASHBOARD_HTML)
+        self.assertIn("setInterval(sendManual,100)", DASHBOARD_HTML)
+        self.assertIn("pointerdown", DASHBOARD_HTML)
+        for event in ("pointerup", "pointercancel", "pointerleave", "visibilitychange"):
+            self.assertIn(event, DASHBOARD_HTML)
+        self.assertIn("fetch('/api/stop',{method:'POST'})", DASHBOARD_HTML)
+        self.assertIn("Manual request failed: ${error.message}; STOP sent", DASHBOARD_HTML)
+        self.assertIn("/api/manual/hold", DASHBOARD_HTML)
+        self.assertIn("function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}", DASHBOARD_HTML)
+        self.assertNotIn("/api/arm-motor-output", DASHBOARD_HTML)
+
+    def test_dashboard_disables_mode_selection_for_ready_physical_manual_standby(self):
+        from field_control.web import DASHBOARD_HTML
+
+        self.assertIn('id="manual-mode"', DASHBOARD_HTML)
+        self.assertIn("const manualReady=p.mode==='MANUAL'&&p.physical_web_standby.active", DASHBOARD_HTML)
+        self.assertIn("document.getElementById('manual-mode').disabled=manualReady", DASHBOARD_HTML)
+        self.assertIn("Manual is already ready. Hold a direction button; do not press MANUAL.", DASHBOARD_HTML)
 
     def test_logical_forward_is_signed_once_by_verified_remote_a2_profile(self):
         from remote_control.config import ControlConfig
@@ -69,6 +144,12 @@ class ManualWebTests(unittest.TestCase):
                 status, body = self.request(rejected, "/api/manual/forward")
                 self.assertEqual(status, 409); self.assertEqual(body["error"], message)
                 self.assertEqual(rejected.commands, [])
+
+    def test_browser_has_no_motor_arm_route(self):
+        runtime = FakeRuntime(6.0)
+        status, _body = self.request(runtime, "/api/arm-motor-output")
+        self.assertEqual(status, 404)
+        self.assertEqual(runtime.commands, [])
 
 
 if __name__ == "__main__":

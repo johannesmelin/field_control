@@ -9,7 +9,8 @@ import math
 class DriveGeometry:
     left_wheel_circumference_m: float = .805
     right_wheel_circumference_m: float = .805
-    wheel_track_m: float = 1.01
+    # Measured centre-to-centre wheel track: 100.5 cm.
+    wheel_track_m: float = 1.005
     motor_turns_per_wheel_turn: float = 8.0
     left_forward_sign: int = 1
     right_forward_sign: int = -1

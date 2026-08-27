@@ -10,6 +10,10 @@ from collections import deque
 import math
 
 
+class RowHeadingReferenceDistanceError(ValueError):
+    """A row-following distance violates the reference's forward invariant."""
+
+
 def wrap_degrees(value: float) -> float:
     wrapped = value % 360.0
     return 0.0 if math.isclose(wrapped, 360.0, abs_tol=1e-9) else wrapped
@@ -49,7 +53,7 @@ class RowHeadingReference:
             raise ValueError("heading och sträcka måste vara ändliga")
         heading = wrap_degrees(heading_deg)
         if self._samples and distance_m < self._samples[-1][0]:
-            raise ValueError("odometristräckan får inte minska")
+            raise RowHeadingReferenceDistanceError("odometristräckan får inte minska")
         previous_distance = self._samples[-1][0] if self._samples else distance_m
         self._reliable_distance_m += max(0.0, distance_m - previous_distance)
         self._samples.append((distance_m, heading))

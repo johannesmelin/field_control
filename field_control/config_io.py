@@ -124,7 +124,9 @@ def _physical(value: Any) -> PhysicalCanConfig:
     defaults = PhysicalCanConfig(); kwargs: dict[str, Any] = {}
     for field in fields(PhysicalCanConfig):
         item, path = data.get(field.name, getattr(defaults, field.name)), f"physical_can.{field.name}"
-        kwargs[field.name] = (_boolean(item, path) if field.name in ("enabled", "confirm_physical_stop_tested", "confirm_wheels_raised")
+        kwargs[field.name] = (_boolean(item, path) if field.name in ("enabled", "confirm_physical_stop_tested", "confirm_wheels_raised",
+                                                                       "confirm_ground_test", "confirm_ground_clear",
+                                                                       "confirm_emergency_stop_ready")
                               else _optional_string(item, path))
     return PhysicalCanConfig(**kwargs)
 
@@ -138,7 +140,7 @@ def runtime_config_from_dict(value: Any) -> RuntimeConfig:
     }
     floats = {"heading_filter_alpha", "row_heading_window_m", "heading_reference_min_distance_m",
               "camera_timeout_s", "imu_timeout_s", "odometry_timeout_s", "control_lease_timeout_s",
-              "watchdog_period_s", "max_control_stall_s", "row_spacing_m", "navigation_frame_rate_hz",
+              "watchdog_period_s", "max_control_stall_s", "physical_web_standby_timeout_s", "row_spacing_m", "navigation_frame_rate_hz",
               "stream_fps", "max_rpm", "manual_rpm", "auto_base_rpm", "search_speed_rpm", "turn_speed_rpm",
               "vision_kp", "vision_deadband_px", "max_vision_correction_rpm", "heading_kp",
               "heading_deadband_deg", "max_heading_correction_rpm"}
