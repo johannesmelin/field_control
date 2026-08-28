@@ -49,7 +49,7 @@ class ManualWebTests(unittest.TestCase):
             _manual_rpm_from_query("rpm=5.1", default_rpm=30, max_rpm=40,
                                    motor_turns_per_wheel_turn=8)
 
-    def test_configuration_api_requires_manual_no_lease_and_disarmed_output(self):
+    def test_configuration_api_stages_profile_even_while_auto_is_active(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()
         runtime.status = lambda: SimpleNamespace(mode="AUTO", motor_output_armed=False)
         runtime.lease = SimpleNamespace(valid=lambda _now: False)
@@ -61,7 +61,7 @@ class ManualWebTests(unittest.TestCase):
             handler.send_response = lambda status, *_args: response.append(status); handler.send_header = lambda *_args: None
             handler.end_headers = lambda: None; handler.send_error = lambda status, *_args: response.append(status)
             handler.do_POST()
-            self.assertEqual(response, [409])
+            self.assertEqual(response, [200])
 
     def test_configuration_api_saves_restart_staged_profile_when_safe(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()
@@ -396,6 +396,8 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn('class="panel compact-status"', DASHBOARD_HTML)
         for heading in ("Runtime", "Sensors", "Heading", "Vision and odometry"):
             self.assertIn(f"<h3>{heading}</h3>", DASHBOARD_HTML)
+        self.assertNotIn("A4 awaits actual encoder angles.", DASHBOARD_HTML)
+        self.assertNotIn("A4 turns blocked.", DASHBOARD_HTML)
 
     def test_every_configuration_rpm_field_is_wheel_side_and_saved_once_at_8_to_1(self):
         from field_control.web import DASHBOARD_HTML

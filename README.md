@@ -514,9 +514,9 @@ och `log_level` är en av `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
 
 Dashboardens ruta **Configuration** sparar operatörsparametrar som
 `konfigurationer/konfig_YYYYMMDD_HHMMSS.json`. Sparning och val av profil är
-endast möjligt i `MANUAL`, utan aktiv control-lease och med disarmerad
-motorutgång. Ändringen är alltid staged och börjar gälla först efter nästa
-processstart; den ändrar aldrig en redan körande runtime.
+alltid tillgängligt, även under armerad eller automatisk drift. Ändringen är
+alltid staged och börjar gälla först efter nästa processstart; den ändrar
+aldrig en redan körande runtime.
 
 Vid start laddas den senast sparade profilen automatiskt. Väljs en annan profil
 i dashboarden blir den vald för nästa start. `--profile NAMN` väljer i stället
@@ -539,9 +539,12 @@ new-row-riktning och antal rader.
 
 **Reload/restart from configuration** sparar först den visade kandidaten som
 vald profil och gör sedan en kontrollerad processomstart. Knappen kräver
-MANUAL, disarmerad utgång och ingen aktiv lease. Den kan aldrig armera motorer:
-en eventuell lokal `--arm-motor-output`-flagga tas bort före omstart och alla
-vanliga CLI-gates kontrolleras igen.
+inte ett särskilt driftläge: den reserverar först command-pathen, skickar
+verifierad STOP+0x9C-settle och startar sedan om processen med den sparade
+profilen. Om processen redan hade startats lokalt med
+`--arm-motor-output` bevaras just den lokala flaggan över omstarten; en
+webbläsare kan aldrig lägga till flaggan eller armera en annars disarmerad
+process.
 
 Ett minimalt säkert JSON-dokument kan lämna fysisk output avstängd:
 
@@ -579,12 +582,16 @@ kräver en redan fullständigt validerad `physical_can`-konfiguration (inklusive
 marktest- eller upphissad-hjul-gates), bindning till en numerisk loopback-IP
 och två separata CLI-bekräftelser. Den startar alltid disarmerad; webbläsaren
 kan aldrig armera motorerna. Om lokal armering avsiktligt önskas görs den först
-efter att runtime, watchdog och färsk 0x92-odometri är igång och fortfarande i
-`MANUAL`. Den byts sedan omedelbart till en konfigurerbar (högst 180 s), helt
+efter att runtime och watchdog är igång och fortfarande i `MANUAL`. Den byts
+sedan omedelbart till en konfigurerbar (högst 180 s), helt
 stillastående webb-standby utan aktiv drive-lease. Första giltiga webbaserade
 MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 300 ms-lease. AUTO-
-valet ensamt kan inte förnya eller ta över den. Timeout, STOP, MANUAL-val,
-fel, CAN-/odometrifel, watchdog och stängning disarmerar standby:
+valet ensamt kan inte förnya eller ta över den. `ROW_LOST`, explicit STOP,
+lease-/watchdog-expiry och återställbara runtime-fel köar nollutgång och går
+till armerad, stillastående MANUAL-standby; en ny manuell riktning claimar
+alltid en ny lease. Processavslutning och ett latchat CAN-workerfel stänger
+däremot den fysiska gränsen och disarmerar, eftersom en ny säker command då
+inte kan garanteras:
 
 ```bash
 field-control --config field_control_physical.json \
@@ -596,7 +603,6 @@ field-control --config field_control_physical.json \
 Utelämna `--arm-motor-output` för en fysisk CAN-diagnostikstart som förblir
 disarmerad. `--physical-web` avvisar andra adresser än loopback-IP; publicera
 inte dashboarden över nätverket innan en separat autentiserad design finns.
-STOP, kontroll-lease, watchdog och runtime-fel disarmerar fortsatt output.
 De separata raised-wheel-HIL-körarna används fortfarande för avgränsade
 motorprover.
 
@@ -606,7 +612,8 @@ riktningsknapp skickar den konfigurerade hastigheten. När knappen släpps
 skickar dashboarden därefter ett serverfixerat `0 RPM`-kommando var 100 ms och
 behåller den korta control-leasen, så ett nytt riktningskommando kan provas
 utan omstart. Den röda STOP-knappen, fokus-/sidförlust, nätfel eller uteblivna
-uppdateringar använder däremot hård STOP och disarmerar utgången. I den
+uppdateringar köar STOP och lämnar sedan armerad webbstandby redo för ett nytt
+manuellt kommando. I den
 fysiska webbstandbyn är MANUAL redan valt; tryck inte MANUAL-knappen, utan
 håll direkt inne en riktningsknapp.
 

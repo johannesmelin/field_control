@@ -86,6 +86,23 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
         runtime.tick()
         self.assertIs(runtime._turn_controller, controller)
 
+    def test_configuration_restart_blocks_a4_after_pre_admission_pause(self):
+        runtime, _imu, _odometry, _motor = self.make_runtime()
+        motor = PositionMotor()
+        runtime.motor = motor
+        runtime._lifecycle = _Lifecycle.RUNNING
+        runtime._lease_token = runtime.lease.acquire()
+        motor.stop_and_settle_for_restart = lambda _reason: setattr(motor, "armed", False)
+        entered, release = threading.Event(), threading.Event()
+        runtime._before_position_command_admission = lambda: (entered.set(), release.wait(.5))
+        tick = threading.Thread(target=runtime.tick, daemon=True)
+        tick.start(); self.assertTrue(entered.wait(.2))
+        self.assertTrue(runtime.reserve_configuration_restart())
+        release.set(); tick.join(.5)
+        self.assertFalse(tick.is_alive())
+        self.assertEqual(motor.requests, [])
+        self.assertEqual(motor.a4_transactions, [])
+
     def test_new_row_turn_uses_same_single_controller_path(self):
         runtime, _imu, _odometry, motor = self.make_runtime(State.AUTO_NEW_ROW_TURN)
         runtime.tick()
@@ -428,7 +445,7 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
         finally:
             odometry.stop()
 
-    def test_auto_pick_hold_preemption_recovers_before_new_row_a4_admission(self):
+    def test_auto_pick_hold_does_not_gate_new_row_a4_admission(self):
         """A one-time AUTO_PICK hold may preempt 0x92 without losing the turn.
 
         This is the ground-HIL ordering: row following reaches PICK while the
@@ -502,10 +519,9 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
             runtime.tick()
             self.assertEqual(runtime.machine.state, State.AUTO_PICK)
             self.assertTrue(backend.hold_queued.is_set())
-            self.assertTrue(runtime._stationary_hold_odometry_recovery_pending)
+            self.assertFalse(runtime._stationary_hold_odometry_recovery_pending)
             self.assertIsNone(runtime.status().fault)
 
-            self.assertTrue(backend.replacement_started.wait(.300))
             for now in (.02, .04, .06):
                 self.now[0] = now
                 runtime.tick()
@@ -513,8 +529,6 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
                 self.assertIsNone(runtime.status().fault)
                 self.assertEqual(motor.requests, [])
 
-            backend.release_replacement.set()
-            self.assertTrue(odometry.wait_until_ready(.150))
             self.now[0] = .12
             runtime._vision = type("Vision", (), {
                 "target_x": 1.0, "bud_in_trigger_zone": False, "bud_in_pick_zone": False,
@@ -543,7 +557,7 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
         self.assertIsNone(runtime._position_turn_request)
         self.assertIn("MANUAL vald", motor.stops)
 
-    def test_stale_odometry_before_marker_turn_transition_still_faults(self):
+    def test_stale_odometry_before_marker_turn_transition_admits_a4_worker(self):
         runtime, imu, _odometry, _old = self.make_runtime(state=State.AUTO_ROW_FOLLOW)
         motor = PositionMotor(); runtime.motor = motor
         runtime.lease = ControlLease(runtime.config.control_lease_timeout_s, clock=lambda: self.now[0])
@@ -555,11 +569,11 @@ class RuntimeTurnIntegrationTests(unittest.TestCase):
             "target_x": 1.0, "bud_in_trigger_zone": False, "bud_in_pick_zone": False,
             "marker_found": True,
         })()
-        runtime.machine._marker_frames = 0
+        runtime.machine._marker_frames = runtime.config.safety.turn_marker_confirm_frames - 1
         runtime.tick()
-        self.assertEqual(runtime.machine.state, State.FAULT)
-        self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
-        self.assertEqual(motor.requests, [])
+        self.assertEqual(runtime.machine.state, State.AUTO_IN_ROW_TURN)
+        self.assertIsNone(runtime.status().fault)
+        self.assertEqual(len(motor.requests), 1)
 
     def test_physical_new_row_a4_is_asymmetric_and_completes_without_imu_gate(self):
         runtime, _imu, _odometry, _old = self.make_runtime(State.AUTO_NEW_ROW_TURN)

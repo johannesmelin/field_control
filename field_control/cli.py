@@ -63,12 +63,12 @@ def _arm_physical_web_output(application: FieldControlApplication) -> None:
 
 
 def _restart_argv(argv: Sequence[str]) -> list[str]:
-    """Retain deployment gates but discard one-run arm/profile overrides."""
+    """Retain locally approved deployment gates; drop only profile override."""
     restarted: list[str] = []
     index = 0
     while index < len(argv):
         argument = argv[index]
-        if argument == "--arm-motor-output" or argument.startswith("--profile="):
+        if argument.startswith("--profile="):
             index += 1
             continue
         if argument == "--profile":
@@ -165,9 +165,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
     if restart:
-        # A browser restart must never inherit the local arm option.  The
-        # deployment remains explicitly physical-web-confirmed, but begins
-        # disarmed and cannot produce a motor command until a fresh local arm.
+        # The browser cannot add flags.  If this process was explicitly
+        # launched locally with --arm-motor-output, retain that same local
+        # approval after verified STOP+0x9C shutdown.  A process launched
+        # without it remains disarmed after restart.
         restart_argv = _restart_argv(effective_argv)
         os.execv(sys.executable, [sys.executable, "-m", "field_control.cli", *restart_argv])
         raise RuntimeError("processomstart returnerade oväntat")

@@ -35,6 +35,7 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
                 "age_s": None if observation is None else observation.imu_age_s,
                 "error": None if observation is None else observation.imu_error},
         "odometry": {"ok": False if observation is None else observation.odometry_fresh,
+                      "degraded_right_encoder": bool(getattr(runtime, "encoder_degraded_status", lambda: False)()),
                       "age_s": None if observation is None else observation.odometry_age_s,
                       "distance_m": odometry_distance,
                       "left_distance_m": None if observation is None or observation.odometry_sample is None else observation.odometry_sample.left_distance_m,

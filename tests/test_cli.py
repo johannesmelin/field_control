@@ -139,17 +139,18 @@ class CliTests(unittest.TestCase):
                     main(["--config", str(path), "--physical-web", "--confirm-physical-web", "--arm-motor-output"])
             application.return_value.close.assert_called_once()
             argv = execv.call_args.args[1]
-            self.assertNotIn("--arm-motor-output", argv)
+            self.assertIn("--arm-motor-output", argv)
 
     def test_restart_arguments_remove_one_run_profile_in_both_supported_forms(self):
         self.assertEqual(
             _restart_argv(["--config", "deployment.json", "--profile", "old.json", "--arm-motor-output"]),
-            ["--config", "deployment.json"],
+            ["--config", "deployment.json", "--arm-motor-output"],
         )
         self.assertEqual(
             _restart_argv(["--config", "deployment.json", "--profile=old.json"]),
             ["--config", "deployment.json"],
         )
+        self.assertNotIn("--arm-motor-output", _restart_argv(["--config", "deployment.json"]))
 
 
 if __name__ == "__main__":

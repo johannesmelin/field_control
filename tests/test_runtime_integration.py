@@ -15,7 +15,7 @@ from field_control.odometry import DriveGeometry, OdometrySample
 from field_control.turn import new_row_turn_plan
 from field_control.lease import ControlLease
 from field_control.runtime import FieldControlRuntime, _Lifecycle
-from field_control.state_machine import State
+from field_control.state_machine import Observation as MachineObservation, State
 from field_control.web import DiagnosticsServer
 from unittest.mock import patch
 
@@ -68,6 +68,31 @@ class RuntimeIntegrationTests(unittest.TestCase):
             runtime.start_auto()
         runtime.cancel_configuration_restart()
         self.assertTrue(runtime.configuration_restart_safe())
+
+    def test_configuration_restart_blocks_a2_after_pre_admission_pause(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = True; self.commands = []; self.settles = []
+            def arm(self, _token): self.armed = True
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, _reason): self.armed = False
+            def stop_and_settle_for_restart(self, reason): self.settles.append(reason); self.armed = False
+
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=Physical())
+        runtime._lifecycle = _Lifecycle.RUNNING
+        entered, release = threading.Event(), threading.Event()
+        runtime._before_auto_command_admission = lambda: (entered.set(), release.wait(.5))
+        command = threading.Thread(target=lambda: runtime._admit_command(WheelCommand(2, 2, "race-a2")), daemon=True)
+        command.start(); self.assertTrue(entered.wait(.2))
+        self.assertTrue(runtime.reserve_configuration_restart())
+        release.set(); command.join(.5)
+        self.assertFalse(command.is_alive())
+        self.assertEqual(runtime.motor.commands, [])
+        self.assertEqual(runtime.motor.settles, ["CONFIGURATION_RESTART"])
 
     def test_imu_only_search_freezes_current_heading_separately_from_visual_reference(self):
         class PassiveSource:
@@ -249,7 +274,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse(runtime.lease.valid(None))
         self.assertEqual(motor.stops, ["STOP"])
 
-    def test_physical_arm_rejects_cold_unresponsive_encoder_before_drive(self):
+    def test_physical_arm_allows_cold_unresponsive_encoder_before_drive(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -280,16 +305,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
             arm = threading.Thread(target=lambda: self._capture(runtime.arm_motor_output, errors))
             arm.start()
             self.assertTrue(backend.read_started.wait(.2))
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
-            # A cold first pair may not be treated as the authorized right
-            # timeout: no encoder authority means no physical arm/A2.
             arm.join(.4)
             self.assertFalse(arm.is_alive())
-            self.assertEqual(len(errors), 1)
-            self.assertIsInstance(errors[0], ValueError)
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
+            self.assertEqual(errors, [])
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
             backend.release.set()
         finally:
             runtime.close()
@@ -433,7 +453,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_start_auto_waits_for_post_stop_odometry_before_state_transition(self):
+    def test_start_auto_does_not_wait_for_post_stop_odometry(self):
         """Start Auto's own hold STOP cannot reuse the preceding 0x92 sample."""
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
@@ -487,20 +507,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
             errors = []
             starter = threading.Thread(target=lambda: self._capture(runtime.start_auto, errors))
             starter.start()
-            self.assertTrue(backend.replacement_started.wait(.3))
-            time.sleep(.11)
-            self.assertTrue(starter.is_alive(), errors)
-            self.assertEqual(runtime.machine.state, State.MANUAL)
+            starter.join(.3)
+            self.assertFalse(starter.is_alive(), errors)
+            self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
             self.assertEqual(motor.holds, ["AUTO startförberedelse"])
             self.assertIsNone(runtime.status().fault)
             self.assertTrue(runtime.lease.valid(runtime._lease_token))
-            with self.assertRaisesRegex(ValueError, "AUTO-start väntar"):
+            with self.assertRaisesRegex(ValueError, "manuellt kommando kräver MANUAL"):
                 runtime.manual_command(WheelCommand(4.0, 4.0, "racing-manual"))
             self.assertEqual(motor.commands, [])
 
-            backend.release_replacement.set()
-            starter.join(.5)
-            self.assertFalse(starter.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
             self.assertFalse(runtime._auto_start_odometry_recovery_pending)
@@ -678,20 +694,28 @@ class RuntimeIntegrationTests(unittest.TestCase):
         class Physical:
             def __init__(self):
                 self.armed = False; self.standby = False; self.holds = []; self.stops = []
+                self.claim_calls = 0; self.commands = []
             def arm(self, _token): self.armed = True
             def enter_web_standby(self, _token): self.standby = True
             def claim_web_standby(self, _token):
                 if not self.standby: raise RuntimeError("standby saknas")
+                self.claim_calls += 1
                 self.standby = False
             def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def command(self, command, _token): self.commands.append(command)
             def stop_all(self, reason): self.standby = False; self.armed = False; self.stops.append(reason)
 
         class BlockingRuntime(FieldControlRuntime):
             def _run(self): self._stop.wait()
 
+        lease = ControlLease(.05)
+        config = RuntimeConfig(**{
+            **self._physical_config().__dict__,
+            "physical_web_standby_timeout_s": .45,
+        })
         motor = Physical()
-        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
-                                  odometry=OdometrySource(Angles(), DriveGeometry()))
+        runtime = BlockingRuntime(config, PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(Angles(), DriveGeometry()), lease=lease)
         runtime.start()
         try:
             self.assertTrue(runtime._odometry.wait_until_ready(.2))
@@ -700,21 +724,100 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertIsNone(runtime._lease_token)
             self.assertEqual(motor.holds, [])
             runtime.select_auto()
-            self.assertFalse(motor.standby)
-            self.assertFalse(motor.armed)
+            # Mode selection retains no-motion standby.  In particular it
+            # must remain safe beyond an ordinary drive lease timeout, since
+            # no drive authority or motor transaction was admitted.
+            time.sleep(.12)
+            self.assertTrue(motor.standby)
+            self.assertTrue(motor.armed)
             self.assertIsNone(runtime._lease_token)
             self.assertEqual(motor.holds, [])
-            self.assertEqual(motor.stops, ["AUTO valt"])
+            self.assertEqual(motor.stops, [])
+            self.assertEqual(runtime.status().mode, "AUTO")
+            with self.assertRaisesRegex(ValueError, "AUTO har valts"):
+                runtime.manual_command(WheelCommand(4.0, 4.0, "manual-must-not-claim"))
+            self.assertTrue(motor.standby)
+            self.assertTrue(motor.armed)
+            self.assertIsNone(runtime._lease_token)
+            self.assertEqual(motor.claim_calls, 0)
+            self.assertEqual(motor.commands, [])
             target = type("Vision", (), {
                 "target_x": 10.0, "bud_in_trigger_zone": False,
                 "bud_in_pick_zone": False, "marker_found": False,
             })()
             runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
                                                True, True, True, OdometrySample(0, 0, 0, 0))
-            with self.assertRaisesRegex(ValueError, "ny encoderavläsning"):
-                runtime.start_auto()
-            self.assertEqual(motor.stops, ["AUTO valt"])
+            runtime.start_auto()
+            self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
+            self.assertFalse(motor.standby)
+            self.assertIsNotNone(runtime._lease_token)
+            self.assertEqual(motor.claim_calls, 1)
+            self.assertEqual(motor.holds, ["AUTO startförberedelse"])
+            self.assertEqual(motor.stops, [])
         finally:
+            runtime.close()
+
+    def test_manual_claim_linearizes_before_auto_selection_stopped_handoff(self):
+        """A manual command already admitted at the lifecycle gate wins once."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self):
+                self.armed = False; self.standby = False; self.claim_calls = 0
+                self.commands = []; self.holds = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): self.standby = True
+            def claim_web_standby(self, _token):
+                if not self.standby: raise RuntimeError("standby saknas")
+                self.claim_calls += 1; self.standby = False
+            def command(self, command, _token): self.commands.append(command)
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
+            def stop_all(self, reason): self.armed = False; self.standby = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        entered, release, errors = threading.Event(), threading.Event(), []
+        motor = Physical()
+        runtime = BlockingRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
+                                  odometry=OdometrySource(Angles(), DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            runtime._before_manual_standby_claim = lambda: (entered.set(), release.wait(.5))
+            manual = threading.Thread(
+                target=lambda: self._capture(
+                    lambda: runtime.manual_command(WheelCommand(4.0, 4.0, "manual-first")), errors),
+                daemon=True,
+            )
+            manual.start()
+            self.assertTrue(entered.wait(.2))
+            selecting = threading.Thread(target=lambda: self._capture(runtime.select_auto, errors), daemon=True)
+            selecting.start()
+            self.assertTrue(selecting.is_alive())
+            release.set()
+            manual.join(.5); selecting.join(.5)
+            self.assertFalse(manual.is_alive())
+            self.assertFalse(selecting.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual([(command.left_rpm, command.right_rpm) for command in motor.commands], [(4.0, 4.0)])
+            self.assertEqual(motor.claim_calls, 1)
+            # Selection observed that MANUAL had already claimed authority,
+            # so it follows the existing stopped local-arm handoff.
+            self.assertEqual(motor.holds, ["AUTO valt"])
+            self.assertEqual(motor.stops, [])
+            self.assertEqual(runtime.status().mode, "AUTO")
+        finally:
+            runtime._before_manual_standby_claim = None
+            release.set()
             runtime.close()
 
     def test_paused_manual_source_stops_reads_and_accepts_held_command(self):
@@ -734,6 +837,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             def arm(self, _token): self.armed = True
             def enter_web_standby(self, _token): self.standby = True
             def claim_web_standby(self, _token): self.standby = False
+            def hold_stopped(self, _reason, _token): pass
             def command(self, command, _token): self.commands.append(command)
             def stop_all(self, reason): self.armed = False; self.standby = False; self.stops.append(reason)
 
@@ -761,8 +865,8 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_auto_selection_resumes_paused_source_and_requires_fresh_sample(self):
-        """AUTO resumes only behind its STOP fence; a missing pair faults closed."""
+    def test_start_auto_resumes_paused_source_after_stopped_hold(self):
+        """Selecting AUTO preserves standby; Start Auto owns the stopped handoff."""
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -778,9 +882,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
             def close(self): self.release.set()
 
         class Physical:
-            def __init__(self): self.armed = False; self.stops = []
+            def __init__(self): self.armed = False; self.standby = False; self.holds = []; self.stops = []
             def arm(self, _token): self.armed = True
-            def enter_web_standby(self, _token): pass
+            def enter_web_standby(self, _token): self.standby = True
+            def claim_web_standby(self, _token): self.standby = False
+            def hold_stopped(self, reason, _token): self.holds.append(reason)
             def stop_all(self, reason): self.armed = False; self.stops.append(reason)
 
         class BlockingRuntime(FieldControlRuntime):
@@ -794,12 +900,20 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(runtime._odometry.wait_until_ready(.2))
             runtime.arm_motor_output_for_web_standby()
             runtime.select_auto()
+            self.assertTrue(runtime._odometry.manual_paused)
+            self.assertTrue(motor.standby)
+            self.assertEqual(motor.holds, [])
+            target = type("Vision", (), {
+                "target_x": 10.0, "bud_in_trigger_zone": False,
+                "bud_in_pick_zone": False, "marker_found": False,
+            })()
+            runtime._observation = Observation(0.0, target, None, None, False, 0.0, 0.0, 0.0, 0.0,
+                                               True, True, True, OdometrySample(0, 0, 0, 0))
+            runtime.start_auto()
             self.assertTrue(backend.second.wait(.2))
             self.assertFalse(runtime._odometry.manual_paused)
-            time.sleep(.07)
-            runtime.tick()
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
-            self.assertEqual(motor.stops[0], "AUTO valt")
+            self.assertEqual(motor.holds, ["AUTO startförberedelse"])
+            self.assertEqual(motor.stops, [])
         finally:
             backend.release.set()
             runtime.close()
@@ -1004,7 +1118,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_stop_cancels_start_auto_waiting_for_post_stop_odometry(self):
+    def test_stop_cancels_start_auto_without_post_stop_odometry_wait(self):
         """A delayed Start Auto caller cannot revive AUTO after operator STOP."""
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
@@ -1052,16 +1166,12 @@ class RuntimeIntegrationTests(unittest.TestCase):
             errors = []
             starter = threading.Thread(target=lambda: self._capture(runtime.start_auto, errors))
             starter.start()
-            self.assertTrue(backend.replacement_started.wait(.3))
-
             runtime.stop()
             self.assertEqual(runtime.machine.state, State.MANUAL)
-            backend.release_replacement.set()
             starter.join(.5)
 
             self.assertFalse(starter.is_alive())
-            self.assertEqual(len(errors), 1)
-            self.assertIsInstance(errors[0], ValueError)
+            self.assertEqual(errors, [])
             self.assertEqual(runtime.machine.state, State.MANUAL)
             # Later control ticks must not resume the cancelled request.
             runtime.tick()
@@ -1104,7 +1214,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_physical_arm_fails_closed_when_first_odometry_sample_times_out(self):
+    def test_physical_arm_allows_first_odometry_sample_timeout(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1131,16 +1241,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
         runtime.start()
         try:
             self.assertTrue(backend.read_started.wait(.2))
-            with self.assertRaisesRegex(ValueError, "fysisk odometri är felaktig eller för gammal"):
-                runtime.arm_motor_output()
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
-            self.assertTrue(motor.stops)
+            runtime.arm_motor_output()
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
+            self.assertIsNone(runtime.status().fault)
         finally:
             runtime.close()
 
-    def test_manual_arm_rejects_malformed_encoder_sample(self):
+    def test_manual_arm_allows_malformed_encoder_sample(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1163,15 +1271,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
                                   odometry=OdometrySource(MalformedAngles(), DriveGeometry()))
         runtime.start()
         try:
-            with self.assertRaisesRegex(ValueError, "odometri"):
-                runtime.arm_motor_output()
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
-            # An unclassified malformed first result is rejected before the
-            # source is paused, so it cannot masquerade as the authorized
-            # typed 0x142 degraded-MANUAL outcome.
-            self.assertFalse(runtime._odometry.manual_paused)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            runtime.arm_motor_output()
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
+            self.assertIsNone(runtime.status().fault)
         finally:
             runtime.close()
 
@@ -1251,7 +1354,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         except Exception as exc:
             errors.append(exc)
 
-    def test_missing_encoder_pair_allows_manual_standby_but_rejects_auto(self):
+    def test_missing_encoder_pair_allows_auto_and_uses_bounded_distance(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1270,6 +1373,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             def arm(self, _token): self.armed = True
             def enter_web_standby(self, _token): self.standby = True
             def claim_web_standby(self, _token): self.standby = False
+            def hold_stopped(self, _reason, _token): pass
             def command(self, command, _token): self.commands.append(command)
             def stop_all(self, reason):
                 self.armed = False; self.standby = False; self.stops.append(reason)
@@ -1287,8 +1391,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             while not odometry.right_encoder_timeout_after_left_reply and time.monotonic() < deadline:
                 time.sleep(.002)
             self.assertTrue(odometry.right_encoder_timeout_after_left_reply)
-            # The verified boundary's arm operation is a STOP+0x9C settle;
-            # missing 0x92 is intentionally degraded MANUAL only.
+            # The verified boundary's arm operation is a STOP+0x9C settle.
             runtime.arm_motor_output_for_web_standby()
             self.assertTrue(motor.armed)
             self.assertTrue(motor.standby)
@@ -1296,17 +1399,35 @@ class RuntimeIntegrationTests(unittest.TestCase):
             runtime.manual_command(WheelCommand(3.0, 3.0, "degraded-manual"))
             self.assertEqual([(command.left_rpm, command.right_rpm) for command in motor.commands], [(3.0, 3.0)])
 
-            # AUTO may not obtain a drive lease or queue A2/A4 until a fresh
-            # paired encoder sample has restored normal odometry.
-            with self.assertRaisesRegex(ValueError, "ny giltig encoderavläsning"):
-                runtime.select_auto()
+            # The exact 0x141 reply / 0x142 timeout keeps the stopped handoff
+            # and lease protocol, but may enter ordinary AUTO navigation with
+            # a conservative command-integrated distance bound.
+            runtime.select_auto()
             self.assertEqual([(command.left_rpm, command.right_rpm) for command in motor.commands], [(3.0, 3.0)])
-            self.assertFalse(motor.armed)
-            with self.assertRaisesRegex(ValueError, "ny giltig encoderavläsning"):
-                runtime.start_auto()
+            self.assertTrue(motor.armed)
+            self.assertTrue(runtime._degraded_auto_odometry_active())
+            runtime._observation = Observation(
+                0.0, None, 0.0, None, False, None, None, None, 0.0,
+                True, True, True,
+            )
+            runtime.start_auto()
             self.assertEqual([(command.left_rpm, command.right_rpm) for command in motor.commands], [(3.0, 3.0)])
-            self.assertFalse(motor.armed)
-            self.assertIn("AUTO nekad: encoderodometri saknas", motor.stops)
+            self.assertTrue(motor.armed)
+            self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
+            runtime._reset_degraded_auto_distance(0.0)
+            runtime._last_command = WheelCommand(1.0, 1.0, "heading")
+            self.assertGreater(runtime._degraded_auto_distance(1.0), 0.0)
+
+            # Without a physical A4 worker/baseline, no encoder angle is
+            # invented by the fallback path.
+            runtime.machine.state = State.AUTO_IN_ROW_TURN
+            result = runtime._tick_turn_controller(
+                0.1, runtime._observation, LatestValue().snapshot(),
+                MachineObservation(0.1, True, True, True, True, False),
+                State.AUTO_IN_ROW_TURN,
+            )
+            self.assertEqual(result.fault, "TURN_ODOMETRY_SAMPLE_MISSING")
+            self.assertIn("TURN_ODOMETRY_SAMPLE_MISSING", motor.stops)
         finally:
             runtime.close()
 
@@ -1335,6 +1456,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             def arm(self, _token): self.armed = True
             def enter_web_standby(self, _token): self.standby = True
             def claim_web_standby(self, _token): self.standby = False
+            def hold_stopped(self, _reason, _token): pass
             def command(self, command, _token): self.commands.append(command)
             def stop_all(self, reason):
                 self.armed = False; self.standby = False; self.stops.append(reason)
@@ -1363,8 +1485,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_manual_arm_rejects_delayed_left_or_generic_encoder_error(self):
-        """Only the typed right-after-left timeout permits cold MANUAL arm."""
+    def test_manual_arm_allows_delayed_left_or_generic_encoder_error(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1398,14 +1519,13 @@ class RuntimeIntegrationTests(unittest.TestCase):
             backend.release.set()
             armer.join(.5)
             self.assertFalse(armer.is_alive())
-            self.assertEqual(len(errors), 1)
-            self.assertIsInstance(errors[0], ValueError)
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
+            self.assertEqual(errors, [])
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
         finally:
             runtime.close()
 
-    def test_known_right_timeout_recovers_fresh_pair_before_auto_is_reenabled(self):
+    def test_known_right_timeout_auto_selection_preserves_web_standby(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1441,22 +1561,18 @@ class RuntimeIntegrationTests(unittest.TestCase):
         try:
             self.assertTrue(backend.timeout_seen.wait(.2))
             runtime.arm_motor_output_for_web_standby()
-            with self.assertRaisesRegex(ValueError, "ny giltig encoderavläsning"):
-                runtime.select_auto()
-            self.assertEqual(motor.commands, [])
-            self.assertFalse(motor.armed)
-
-            backend.recover.set()
-            self.assertTrue(odometry.wait_until_ready(.3))
-            self.assertFalse(runtime._manual_encoder_degraded_active())
-            # A genuinely fresh pair has cleared the one MANUAL-only gate;
-            # normal AUTO selection again follows its own STOP/fresh fence.
             runtime.select_auto()
             self.assertEqual(motor.commands, [])
+            # AUTO selection remains the no-motion web-standby state even
+            # while the right encoder is temporarily unavailable.
+            self.assertTrue(motor.armed)
+            self.assertTrue(motor.standby)
+            self.assertEqual(motor.stops, [])
+
         finally:
             runtime.close()
 
-    def test_later_generic_encoder_error_clears_right_timeout_manual_exception(self):
+    def test_later_generic_encoder_error_does_not_block_manual_arm(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
@@ -1497,10 +1613,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 time.sleep(.002)
             self.assertFalse(odometry.right_encoder_timeout_after_left_reply)
 
-            with self.assertRaisesRegex(ValueError, "odometri"):
-                runtime.arm_motor_output()
-            self.assertFalse(motor.armed)
-            self.assertEqual(motor.arm_calls, 0)
+            runtime.arm_motor_output()
+            self.assertTrue(motor.armed)
+            self.assertEqual(motor.arm_calls, 1)
             self.assertEqual(motor.commands, [])
         finally:
             runtime.close()
@@ -1539,11 +1654,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
         try:
             now[0] = 1.1
             odometry.latest.publish(1.25, now[0])  # Fresh legacy value is forbidden on physical output.
-            with self.assertRaisesRegex(ValueError, "odometri"):
-                runtime.manual_command(WheelCommand(1.0, 1.0, "manual"))
-            self.assertEqual(motor.commands, [])
-            self.assertTrue(motor.stops)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            command = WheelCommand(1.0, 1.0, "manual")
+            runtime.manual_command(command)
+            self.assertEqual(motor.commands, [command])
+            self.assertIsNone(runtime.status().fault)
         finally:
             runtime.close()
 
@@ -1584,12 +1698,13 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 runtime.machine._transition(State.AUTO_ROW_FOLLOW, "test")
             runtime.tick()
             self.assertEqual(motor.commands, [])
-            self.assertTrue(motor.stops)
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
+            # Camera and IMU remain independent safety inputs; numeric
+            # physical odometry itself is no longer an output gate.
+            self.assertEqual(runtime.status().fault, "CAMERA_TIMEOUT/IMU_TIMEOUT")
         finally:
             runtime.close()
 
-    def test_valid_physical_odometry_allows_manual_then_owns_deadline(self):
+    def test_valid_physical_odometry_does_not_own_manual_deadline(self):
         now = [1.0]
 
         class PassiveSource:
@@ -1626,8 +1741,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(motor.commands, [command])
             now[0] = 1.101
             runtime._watchdog_revoke_if_running("CONTROL_LEASE_EXPIRED")
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
-            self.assertTrue(motor.stops)
+            self.assertIsNone(runtime.status().fault)
         finally:
             runtime.close()
 

@@ -50,6 +50,12 @@ class ControlLease:
         self._invoke_revoke(callback)
         return False
 
+    def expired(self, token: str | None) -> bool:
+        """Report expiry without revoking or invoking the output callback."""
+        with self._lock:
+            return (token is not None and token == self._token and self._expires_at is not None
+                    and self._clock() >= self._expires_at)
+
     def run_if_valid(self, token: str | None, operation: Callable[[], object]) -> bool:
         callback = None
         with self._lock:

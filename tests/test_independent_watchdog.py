@@ -66,21 +66,22 @@ class IndependentWatchdogTests(unittest.TestCase):
         with self.assertRaises(ValueError): runtime.arm_motor_output()
         runtime.close()
 
-    def test_stall_revokes_and_queues_stop_without_control_loop_progress(self):
+    def test_stall_queues_stop_then_retains_armed_manual_standby(self):
         runtime, sink, now = self.make_runtime()
         runtime.start(); runtime.arm_motor_output()
         now[0] = .13
         deadline = time.monotonic() + .5
         while runtime.machine.state is not State.FAULT and time.monotonic() < deadline:
             time.sleep(.01)
-        self.assertEqual(runtime.machine.state, State.FAULT)
+        self.assertEqual(runtime.machine.state, State.MANUAL)
         self.assertEqual(runtime.status().fault, "CONTROL_LOOP_STALL")
         self.assertTrue(sink.stops)
-        self.assertFalse(runtime.motor.armed)
+        self.assertTrue(runtime.motor.armed)
         runtime.tick()
-        self.assertEqual(runtime.machine.state, State.FAULT)
-        with self.assertRaises(ValueError):
-            runtime.manual_command(WheelCommand(1, 1, "after watchdog"))
+        self.assertEqual(runtime.machine.state, State.MANUAL)
+        runtime.select_manual()
+        runtime.manual_command(WheelCommand(1, 1, "after watchdog"))
+        self.assertEqual(sink.commands[-1], (1, 1, "after watchdog"))
         runtime.close()
 
     def test_close_gate_rejects_an_arm_that_finishes_after_closing_begins(self):
@@ -214,14 +215,103 @@ class IndependentWatchdogTests(unittest.TestCase):
             time.sleep(.01)
         self.assertEqual(runtime.status().fault, "CONTROL_LEASE_EXPIRED")
         self.assertTrue(sink.stops)
+        self.assertTrue(runtime.motor.armed)
+        self.assertEqual(runtime.machine.state, State.MANUAL)
+        runtime.manual_command(WheelCommand(1, 1, "after lease expiry"))
+        self.assertEqual(sink.commands[-1], (1, 1, "after lease expiry"))
         runtime.close()
 
-    def test_previously_fresh_physical_odometry_times_out_in_manual_without_a_command(self):
-        """The independent watchdog owns a shared encoder deadline in MANUAL.
+    def test_row_lost_stops_to_armed_manual_standby_then_manual_claims_fresh_lease(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            runtime._fail_closed("ROW_LOST")
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            self.assertTrue(runtime.motor.armed)
+            self.assertTrue(sink.stops)
+            self.assertIsNone(runtime._lease_token)
+            runtime.select_manual()
+            runtime.manual_command(WheelCommand(2, 2, "after row lost"))
+            self.assertEqual(sink.commands[-1], (2, 2, "after row lost"))
+        finally:
+            runtime.close()
 
-        There is no subsequent manual request here to discover the stale
-        sample, and the lease remains valid longer than the odometry timeout.
-        """
+    def test_recovery_publication_blocks_manual_claim_until_standby_is_owned(self):
+        runtime, sink, _now = self.make_runtime()
+        entered, release, recovery_errors, manual_errors = (
+            threading.Event(), threading.Event(), [], [],
+        )
+        runtime.start(); runtime.arm_motor_output()
+        runtime._after_recoverable_boundary_standby = lambda: (entered.set(), release.wait(.5))
+        try:
+            recovery = threading.Thread(
+                target=lambda: self._capture(lambda: runtime._fail_closed("ROW_LOST"), recovery_errors),
+                daemon=True,
+            )
+            recovery.start()
+            self.assertTrue(entered.wait(.2))
+            # Boundary STOP is already queued, but lifecycle ownership has
+            # not yet published runtime's standby deadline/state/token.
+            manual = threading.Thread(
+                target=lambda: self._capture(
+                    lambda: runtime.manual_command(WheelCommand(4, 4, "must wait")), manual_errors),
+                daemon=True,
+            )
+            manual.start()
+            self.assertTrue(manual.is_alive())
+            self.assertEqual(sink.commands, [])
+            release.set()
+            recovery.join(.5); manual.join(.5)
+            self.assertFalse(recovery.is_alive())
+            self.assertFalse(manual.is_alive())
+            self.assertEqual(recovery_errors, [])
+            self.assertEqual(manual_errors, [])
+            self.assertEqual(sink.commands[-1], (4, 4, "must wait"))
+            self.assertIsNotNone(runtime._lease_token)
+            self.assertTrue(runtime.lease.valid(runtime._lease_token))
+        finally:
+            runtime._after_recoverable_boundary_standby = None
+            release.set()
+            runtime.close()
+
+    def test_explicit_stop_retains_armed_manual_standby(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            runtime.stop()
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            self.assertTrue(runtime.motor.armed)
+            self.assertTrue(sink.stops)
+            runtime.manual_command(WheelCommand(3, 3, "after explicit stop"))
+            self.assertEqual(sink.commands[-1], (3, 3, "after explicit stop"))
+        finally:
+            runtime.close()
+
+    def test_verified_boundary_fault_still_disarms_instead_of_recovering(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            sink.callback("injected CAN worker failure")
+            self.assertFalse(runtime.motor.armed)
+            runtime._fail_closed("MOTOR_OUTPUT_ERROR: injected CAN failure")
+            self.assertFalse(runtime.motor.armed)
+            with self.assertRaises(ValueError):
+                runtime.manual_command(WheelCommand(1, 1, "must remain blocked"))
+        finally:
+            runtime.close()
+
+    def test_nonrecoverable_sensor_fault_still_disarms(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            runtime._fail_closed("CAMERA_TIMEOUT")
+            self.assertFalse(runtime.motor.armed)
+            self.assertTrue(sink.stops)
+        finally:
+            runtime.close()
+
+    def test_previously_fresh_physical_odometry_does_not_gate_manual_without_a_command(self):
+        """A missing encoder reply is diagnostic while the lease remains valid."""
         now = [0.0]
 
         class Odometry:
@@ -241,20 +331,14 @@ class IndependentWatchdogTests(unittest.TestCase):
         runtime = BlockingRuntime(config, Source(), Source(), motor=motor, odometry=Odometry(), clock=lambda: now[0], lease=lease)
         runtime.start(); runtime.arm_motor_output()
         try:
-            # Establish the deadline from the fresh sample, then cross only
-            # that deadline (not the 120 ms control-stall or 300 ms lease).
+            # Cross only the former encoder deadline, not the lease timeout.
             runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
             now[0] = .101
             runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
 
-            self.assertEqual(runtime.status().fault, "ODOMETRY_TIMEOUT")
-            self.assertEqual(runtime.machine.state, State.FAULT)
-            self.assertEqual(len(sink.stops), 1)
-            self.assertFalse(runtime.motor.armed)
-            with self.assertRaises(ValueError):
-                runtime.manual_command(WheelCommand(1, 1, "after odometry watchdog"))
-            self.assertEqual(sink.commands, [])
-            self.assertEqual(len(sink.stops), 1)
+            self.assertIsNone(runtime.status().fault)
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            self.assertEqual(sink.stops, [])
         finally:
             runtime.close()
 

@@ -147,6 +147,10 @@ class _VerifiedPhysicalMotorBoundary:
         self._lock = threading.RLock()
         self._armed_token: str | None = None
         self._web_standby = False
+        # Set only while a runtime-authorized recovery revokes an ordinary
+        # lease.  The lease callback then queues zero output and publishes
+        # no-motion standby instead of disarming.  It never grants a token.
+        self._recoverable_revoke_reason: str | None = None
         self._fault_reason: str | None = None
         self._closing = False
         self._closed = False
@@ -313,12 +317,51 @@ class _VerifiedPhysicalMotorBoundary:
 
     def lease_revoked(self) -> None:
         with self._lock:
-            self._armed_token = None
+            recovery_reason = self._recoverable_revoke_reason
+            self._recoverable_revoke_reason = None
+            if (recovery_reason is not None and not self._closing and not self._closed
+                    and self._fault_reason is None):
+                self._armed_token = None
+                self._web_standby = True
+                recoverable = True
+            else:
+                recoverable = False
+                self._armed_token = None
             closing = self._closing or self._closed
+        if recoverable:
+            # Lease revocation linearizes after any admitted A2 command.  This
+            # queue-only STOP is therefore the next physical operation and no
+            # fresh command can be admitted without a new token.
+            self._sink.stop_all(recovery_reason)
+            self.events.append(("recoverable-stop", 0.0, 0.0, recovery_reason))
+            return
         # close() issues the stronger verified STOP+0x9C settle itself.  Do not
         # enqueue a second best-effort stop for a revocation it initiated.
         if not closing:
             self._sink.stop_all("control-lease återkallades")
+
+    def recoverable_stop_to_web_standby(self, reason: str) -> bool:
+        """Revoke authority into stopped, armed web standby.
+
+        The runtime invokes this only for operator-recoverable conditions.
+        Revocation remains the linearization point: it waits behind any
+        already-admitted command, then ``lease_revoked`` queues zero output
+        and leaves only no-motion standby.  A worker/boundary fault, close,
+        or a competing STOP rejects this path and retains fail-closed output.
+        """
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("återställningsstopp kräver orsak")
+        with self._lock:
+            if (self._closing or self._closed or self._fault_reason is not None
+                    or (self._armed_token is None and not self._web_standby)):
+                return False
+            self._recoverable_revoke_reason = reason
+        if self._lease.revoke_any():
+            with self._lock:
+                return self._web_standby and self._fault_reason is None
+        with self._lock:
+            self._recoverable_revoke_reason = None
+        return False
 
     def close(self) -> None:
         if not self._begin_close():

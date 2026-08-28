@@ -16,7 +16,7 @@ from .lease import ControlLease
 from .observation import (HeadingProcessor, ImuReading, Observation as SensorObservation,
                           build_observation, forward_distance_from_odometry)
 from .sources import CameraSource, ImuSource, OdometrySource, SourceSnapshot
-from .odometry import OdometrySample
+from .odometry import OdometrySample, motor_rpm_to_wheel_rpm
 from .state_machine import FieldStateMachine, Observation, Snapshot, State
 from .turn import absolute_position_turn, in_row_turn_plan, new_row_turn_targets
 from .turn_controller import TurnController, TurnObservation
@@ -123,12 +123,26 @@ class FieldControlRuntime:
         # separate from RowHeadingReference: it must never be reported as a
         # visually reliable row direction or be used after visual reacquire.
         self._temporary_search_heading_deg: float | None = None
+        # The state machine deliberately remains in MANUAL after selecting
+        # AUTO and before Start Auto.  Keep that no-motion UI state separate
+        # so a held MANUAL route cannot claim web standby or emit A2 during
+        # the interval.
+        self._auto_selected = False
         # Test-only seam. Production leaves this unset; it is reached after
         # capturing an admitted AUTO lease token and before queue admission.
         self._before_auto_command_admission: Callable[[], None] | None = None
+        # Test-only seam immediately before a physical A4 lifecycle
+        # admission. Production leaves this unset.
+        self._before_position_command_admission: Callable[[], None] | None = None
         # Test-only seam immediately after Start-Auto reserves its exclusive
         # transition and before it can claim web standby or fence odometry.
         self._before_auto_start_transition: Callable[[], None] | None = None
+        # Test-only seam after MANUAL has been checked but before it can
+        # claim web standby.  Production leaves this unset.
+        self._before_manual_standby_claim: Callable[[], None] | None = None
+        # Test-only seam after the boundary has queued a recoverable STOP but
+        # before runtime publishes the matching standby state.
+        self._after_recoverable_boundary_standby: Callable[[], None] | None = None
         # Test-only close linearization seam; unset in production.
         self._after_closing_before_revoke: Callable[[], None] | None = None
         # Test-only watchdog seam immediately before its final lifecycle gate.
@@ -149,6 +163,13 @@ class FieldControlRuntime:
         # can be selected. STOP+0x9C, leases, watchdogs and CAN-TX failures
         # remain owned by the verified motor boundary.
         self._manual_encoder_degraded = False
+        # The one authorised degraded physical mode is a typed 0x141 reply
+        # followed by a 0x142 timeout.  AUTO may use it for ordinary
+        # heading/vision following only; it has no per-wheel feedback and
+        # therefore never admits an A4 position turn.
+        self._degraded_auto_odometry = False
+        self._degraded_auto_distance_m = 0.0
+        self._degraded_auto_last_update_s: float | None = None
         # ``select_auto`` deliberately queues a STOP before AUTO may be
         # started.  With the shared CAN worker that STOP can preempt a 0x92
         # source read.  Keep the runtime in stopped MANUAL until a *new*
@@ -254,6 +275,8 @@ class FieldControlRuntime:
             if self._lifecycle is _Lifecycle.CLOSED:
                 return
             self._lifecycle = _Lifecycle.CLOSING
+            with self._state_lock:
+                self._auto_selected = False
             self._clear_stopped_hold()
             self._clear_web_standby()
             self._cancel_pending_auto_start()
@@ -367,12 +390,6 @@ class FieldControlRuntime:
                 # cache.  Remaining in MANUAL is deliberate until a new
                 # source sample is available or the bounded recovery faults.
                 return self.status()
-        if self._stationary_hold_odometry_recovery_pending:
-            if not self._complete_stationary_hold_odometry_recovery_if_ready(now):
-                # A stationary AUTO hold has already queued STOP.  Do not
-                # inspect the intentionally invalidated shared source or
-                # admit the next automatic action until a fresh pair arrives.
-                return self.status()
         # Physical lease expiry is owned by the independent watchdog.  It has
         # a final lifecycle-gated revocation path, unlike an in-flight control
         # tick that may overlap CLOSING.  Dry-run/default boundaries retain
@@ -403,11 +420,18 @@ class FieldControlRuntime:
                 # inside RowHeadingReference for genuine row-following.
                 row_follow_active = self.machine.state is State.AUTO_ROW_FOLLOW
             try:
+                try:
+                    heading_distance_m = forward_distance_from_odometry(self._odometry_snapshot(now).value)
+                except (TypeError, ValueError):
+                    # Encoder values are diagnostic in this mode. Never let
+                    # a malformed/missing reply turn an otherwise fresh IMU
+                    # update into a runtime exception or fabricated reading.
+                    heading_distance_m = self._degraded_auto_distance(now) if self._is_physical_output() else 0.0
                 self.heading.update(imu.value, visual_following=(row_follow_active and camera.connected
                                                                 and camera.age_s(now) is not None
                                                                 and camera.age_s(now) <= self.config.camera_timeout_s
                                                                 and self._vision is not None and self._vision.target_x is not None),
-                                    distance_m=forward_distance_from_odometry(self._odometry_snapshot(now).value))
+                                    distance_m=heading_distance_m)
                 self._imu_sequence += 1
                 if self.heading.reference.reliable != self._last_heading_reference_reliable:
                     self.events.record("heading_reference_reliable", timestamp_s=now,
@@ -435,6 +459,24 @@ class FieldControlRuntime:
             now, camera, imu, odometry_snapshot, self._vision, self.heading,
             self.config.camera_timeout_s, self.config.imu_timeout_s, self.config.odometry_timeout_s,
         )
+        degraded_auto = self._is_physical_output() and not sensor.odometry_fresh
+        if degraded_auto:
+            # This substitution is limited to the typed right-encoder outage.
+            # It supplies only a conservative travel upper bound to the pure
+            # state machine; ``odometry_sample`` remains absent, so no code
+            # can mistake it for per-wheel feedback or a visual row heading.
+            degraded_distance_m = self._degraded_auto_distance(now)
+            sensor = replace(
+                sensor,
+                odometry_fresh=True,
+                distance_m=degraded_distance_m,
+                fault=None if sensor.fault == "ODOMETRY_TIMEOUT" else sensor.fault,
+            )
+            with self._lock:
+                self._degraded_auto_odometry = True
+        elif self._is_physical_output():
+            with self._lock:
+                self._degraded_auto_odometry = False
         if row_reference_fault is not None:
             sensor = replace(sensor, fault=row_reference_fault)
             with self._lock:
@@ -463,7 +505,8 @@ class FieldControlRuntime:
             return self.status()
         a4_worker_owns_odometry = self._a4_worker_owns_odometry()
         a4_transaction_owns_odometry = self._a4_admission_pending or a4_worker_owns_odometry
-        if not a4_transaction_owns_odometry and not self._manual_encoder_degraded_active():
+        if (not a4_transaction_owns_odometry and not self._manual_encoder_degraded_active()
+                and not degraded_auto):
             odometry_fault = self._physical_odometry_fault_if_due(now)
             if odometry_fault is not None:
                 self._fail_closed(odometry_fault)
@@ -533,7 +576,8 @@ class FieldControlRuntime:
                 # the authority, not CONTROL_LEASE_EXPIRED/stall.  Continue
                 # checking physical health while it remains no-motion.
                 motor_fault = getattr(self.motor, "fault_reason", None)
-                odometry_fault = (None if self._manual_encoder_degraded_active()
+                odometry_fault = (None if (self._manual_encoder_degraded_active()
+                                            or self._degraded_auto_odometry_active())
                                   else self._physical_odometry_fault_if_due(now))
                 if motor_fault is not None:
                     self._trip_independent_watchdog(str(motor_fault))
@@ -595,14 +639,11 @@ class FieldControlRuntime:
                     return
                 self._trip_independent_watchdog("ODOMETRY_TIMEOUT")
                 return
-            if self._stationary_hold_odometry_recovery_pending:
-                self._complete_stationary_hold_odometry_recovery_if_ready(self._clock())
-                if self._stationary_hold_odometry_recovery_pending:
-                    return
             if self._a4_admission_timed_out(self._clock()):
                 self._trip_independent_watchdog("TURN_A4_ADMISSION_TIMEOUT")
                 return
-            if not self._a4_worker_owns_odometry() and not self._manual_encoder_degraded_active():
+            if (not self._a4_worker_owns_odometry() and not self._manual_encoder_degraded_active()
+                    and not self._degraded_auto_odometry_active()):
                 odometry_fault = self._physical_odometry_fault_if_due(self._clock())
                 if odometry_fault is not None:
                     self._trip_independent_watchdog(odometry_fault)
@@ -612,6 +653,16 @@ class FieldControlRuntime:
                 with self._lock:
                     if now - self._last_control_heartbeat_s < self.config.max_control_stall_s:
                         return
+                self._trip_independent_watchdog(reason)
+                return
+            if reason == CONTROL_LEASE_EXPIRED:
+                # The boundary revokes the lease as part of its atomic
+                # zero-output-to-web-standby handoff, before the ordinary
+                # watchdog callback could disarm it.
+                with self._lock:
+                    token = self._lease_token
+                if not self.lease.expired(token):
+                    return
                 self._trip_independent_watchdog(reason)
                 return
             try:
@@ -631,45 +682,16 @@ class FieldControlRuntime:
                                      value.forward_distance_m, value.yaw_change_deg))
 
     def _physical_odometry_fault_if_due(self, now_s: float, *, require_armed: bool = True) -> str | None:
-        """Validate the shared encoder source and maintain its hard deadline.
+        """Encoder availability is diagnostic, never an output gate.
 
-        Physical operation with an installed encoder source accepts only a
-        connected, fresh immutable :class:`OdometrySample`. Numeric legacy
-        snapshots remain valid for disabled/simulated outputs, but never for a
-        physical motor boundary. Raised-wheel HIL runners have no odometry
-        source and retain their lease-only behavior.
+        The motor boundary continues to own CAN transmission, STOP, lease and
+        worker-fault handling.  Missing angle replies instead take the bounded
+        command-integrated distance path in :meth:`tick`.
         """
-        if not self._is_physical_output() or self._odometry is None:
-            return None
-        if require_armed and not getattr(self.motor, "armed", False):
-            return None
-        # Physical MANUAL deliberately pauses the shared 0x92 producer before
-        # a held A2 command may be admitted.  A paused source has an explicit
-        # no-active/no-future-read acknowledgement, so it is neither stale
-        # navigation data nor a CAN health failure.  AUTO always resumes it
-        # behind a fresh post-STOP recovery fence.
-        if (isinstance(self._odometry, OdometrySource) and self._odometry.manual_paused
-                and self.machine.state is State.MANUAL):
-            return None
-        try:
-            snapshot = self._odometry_snapshot(now_s)
-        except Exception as exc:
-            return f"ODOMETRY_SOURCE_ERROR: {type(exc).__name__}: {exc}"
-
-        updated_at_s = snapshot.updated_at_s
-        fresh = (snapshot.connected and self._valid_physical_odometry_sample(snapshot.value)
-                 and updated_at_s is not None and snapshot.age_s(now_s) is not None
-                 and snapshot.age_s(now_s) <= self.config.odometry_timeout_s)
-        if not fresh:
-            # Invalid, missing, disconnected, or stale data must stop an
-            # armed physical boundary now, not after an older deadline or a
-            # later manual command happens to inspect it.
-            return "ODOMETRY_TIMEOUT"
-        deadline = float(updated_at_s) + self.config.odometry_timeout_s
-        with self._lock:
-            self._physical_odometry_deadline_s = max(
-                deadline, self._physical_odometry_deadline_s or deadline,
-            )
+        # Encoder replies are observational, not an actuator-authority
+        # precondition.  Missing 0x92 values use the bounded distance
+        # estimator below; CAN TX/worker faults remain owned by the motor
+        # boundary and are still fail-closed.
         return None
 
     def _manual_encoder_degraded_active(self) -> bool:
@@ -696,6 +718,54 @@ class FieldControlRuntime:
             return False
         return True
 
+    def _degraded_auto_odometry_active(self) -> bool:
+        """Whether the exact accepted right-encoder outage owns AUTO distance.
+
+        A later good pair immediately restores ordinary odometry.  Any other
+        source error is deliberately *not* classified as degraded operation.
+        """
+        with self._lock:
+            return self._degraded_auto_odometry
+
+    def _reset_degraded_auto_distance(self, now_s: float) -> None:
+        with self._lock:
+            self._degraded_auto_distance_m = 0.0
+            self._degraded_auto_last_update_s = now_s
+
+    def _degraded_auto_distance(self, now_s: float) -> float:
+        """Return a bounded conservative upper bound for AUTO travel.
+
+        No encoder value is fabricated.  While a nonzero ordinary AUTO
+        command is live, integrate the greatest allowed wheel speed and the
+        larger configured wheel circumference.  The interval is monotonic and
+        bounded by the control-stall watchdog threshold: a longer pause is
+        independently stopped before it can authorize more movement.
+        """
+        with self._lock:
+            previous = self._degraded_auto_last_update_s
+            self._degraded_auto_last_update_s = now_s
+            command = self._last_command
+            distance = self._degraded_auto_distance_m
+        if previous is None:
+            return distance
+        elapsed_s = max(0.0, min(now_s - previous, self.config.max_control_stall_s))
+        moving = (command is not None
+                  and (command.left_rpm != 0.0 or command.right_rpm != 0.0))
+        if moving and elapsed_s > 0.0:
+            wheel_rpm = motor_rpm_to_wheel_rpm(self.config.max_rpm, self.config.odometry_geometry)
+            upper_speed_m_s = wheel_rpm * max(
+                self.config.odometry_geometry.left_wheel_circumference_m,
+                self.config.odometry_geometry.right_wheel_circumference_m,
+            ) / 60.0
+            distance += upper_speed_m_s * elapsed_s
+            with self._lock:
+                self._degraded_auto_distance_m = distance
+        return distance
+
+    def encoder_degraded_status(self) -> bool:
+        """Public diagnostics flag; it grants no command authority."""
+        return self._manual_encoder_degraded_active() or self._degraded_auto_odometry_active()
+
     def _known_right_encoder_timeout_after_left_reply(self) -> bool:
         """Return only the exact, explicitly accepted 0x142 encoder fault."""
         return (isinstance(self._odometry, OdometrySource)
@@ -703,6 +773,10 @@ class FieldControlRuntime:
 
     def _trip_independent_watchdog(self, reason: str) -> None:
         """Fail closed without socket I/O or waiting on the CAN worker."""
+        if self._operator_recoverable_reason(reason):
+            self._record_fault(reason)
+            if self._recover_to_web_manual_standby(reason, fault=True):
+                return
         if self._web_standby_active():
             self._record_fault(reason)
             try:
@@ -721,10 +795,13 @@ class FieldControlRuntime:
             pass
 
     def status(self) -> RuntimeStatus:
+        with self._state_lock:
+            state = self.machine.state
+            auto_selected = self._auto_selected
         with self._lock:
             armed = bool(getattr(self.motor, "armed", False))
-            with self._state_lock: state = self.machine.state
-            return RuntimeStatus(bool(self._thread and self._thread.is_alive()), "AUTO" if state.value.startswith("AUTO") else "MANUAL",
+            return RuntimeStatus(bool(self._thread and self._thread.is_alive()),
+                                 "AUTO" if auto_selected or state.value.startswith("AUTO") else "MANUAL",
                                  state.value, self._last_snapshot, self._observation,
                                  self._last_command, self._last_admitted_nonzero_command,
                                  armed, self._fault)
@@ -749,18 +826,35 @@ class FieldControlRuntime:
                             and not self._arming_in_progress)
 
     def reserve_configuration_restart(self) -> bool:
-        """Atomically reserve a safe runtime for a clean configuration restart."""
+        """Fence commands, then reach verified zero output for restart."""
         with self._lifecycle_lock:
             with self._lock:
-                with self._state_lock:
-                    if (self._configuration_restart_pending
-                            or self.machine.state is not State.MANUAL
-                            or bool(getattr(self.motor, "armed", False))
-                            or self._lease_token is not None
-                            or self._arming_in_progress):
-                        return False
-                    self._configuration_restart_pending = True
-                    return True
+                if self._configuration_restart_pending or self._lifecycle in (_Lifecycle.CLOSING, _Lifecycle.CLOSED):
+                    return False
+                # Publish the fence before any potentially bounded motor
+                # operation. Manual/AUTO paths check this under the same
+                # lifecycle lock, so no stale admission can pass around the
+                # restart STOP.
+                self._configuration_restart_pending = True
+            self._cancel_pending_auto_start()
+            self._clear_turn_controller()
+            settle = getattr(self.motor, "stop_and_settle_for_restart", None)
+            try:
+                if self._is_physical_output() and callable(settle):
+                    settle("CONFIGURATION_RESTART")
+                else:
+                    self._stop_motor("CONFIGURATION_RESTART")
+            except Exception as exc:
+                self._record_fault(f"CONFIGURATION_RESTART_STOP_FAILURE: {type(exc).__name__}: {exc}")
+                return False
+            with self._lock:
+                self._lease_token = None
+                self._web_standby_deadline_s = None
+                self._last_command = None
+            with self._state_lock:
+                self._auto_selected = False
+                self.machine.stop("Konfigurationsomstart")
+            return True
 
     def cancel_configuration_restart(self) -> None:
         """Release an uncommitted restart reservation after persistence failure."""
@@ -1085,7 +1179,13 @@ class FieldControlRuntime:
                                                 self.config.safety.new_row_turn_direction,
                                                 self.config.safety.inner_wheel_min_ratio)
                 target = absolute_position_turn(plan, self.config.odometry_geometry)
-                self._position_turn_request = position_begin(
+                hook = self._before_position_command_admission
+                if hook is not None:
+                    hook()
+                with self._lifecycle_lock:
+                    if self._configuration_restart_pending:
+                        return self.machine.snapshot(now_s)
+                    self._position_turn_request = position_begin(
                     left_wheel_degrees=target.left_wheel_degrees,
                     right_wheel_degrees=target.right_wheel_degrees,
                     max_motor_rpm=min(self.config.turn_speed_rpm, self.config.max_rpm),
@@ -1096,7 +1196,7 @@ class FieldControlRuntime:
                     timeout_s=self.config.safety.turn_timeout_s,
                     deadline_s=now_s + self.config.safety.turn_timeout_s,
                     token=self._lease_token,
-                )
+                    )
                 self._position_turn_admission_deadline_s = now_s + A4_WORKER_ADMISSION_BOUND_S
                 self._turn_state = state
                 return self.machine.snapshot(now_s)
@@ -1189,9 +1289,12 @@ class FieldControlRuntime:
         if active and state not in (State.AUTO_START_DELAY, State.AUTO_PICK,
                                     State.AUTO_IN_ROW_TURN, State.AUTO_NEW_ROW_TURN):
             if observation.visual_target and observation.vision is not None:
+                overlay = getattr(observation.vision, "overlay", None)
+                width = (overlay.shape[1] if getattr(overlay, "shape", None) is not None
+                         else self.config.processing_width)
                 command = vision_command(
                     observation.vision.target_x or 0.0,
-                    self.config.vision.x_goal * observation.vision.overlay.shape[1],
+                    self.config.vision.x_goal * width,
                     self.config.auto_base_rpm, self.config.vision_kp,
                     self.config.vision_deadband_px, self.config.max_vision_correction_rpm,
                     self.config.max_rpm,
@@ -1316,6 +1419,8 @@ class FieldControlRuntime:
                     return
                 if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
                     return
+                if self._configuration_restart_pending:
+                    return
                 self.motor.command(command, token)
                 self._record_admitted_nonzero_command(command)
 
@@ -1341,50 +1446,18 @@ class FieldControlRuntime:
         manual_source = self._odometry if (self._is_physical_output() and arming_manual
                                            and isinstance(self._odometry, OdometrySource)) else None
         manual_encoder_ready = False
-        if manual_source is not None:
-            # Do not pause a cold source before its first bounded 0x92 pair
-            # has produced an outcome.  The exact typed right-after-left
-            # timeout is MANUAL-only authorization; all unknown or generic
-            # failures remain fail-closed.
-            if not manual_source.wait_for_manual_arming_outcome(self.config.odometry_timeout_s):
-                self._fail_closed("ODOMETRY_TIMEOUT")
-                raise ValueError("fysisk odometri är felaktig eller för gammal")
-        if arming_manual and self._odometry is not None:
-            try:
-                sample = self._odometry_snapshot(self._clock())
-                manual_encoder_ready = (
-                    sample.connected and self._valid_physical_odometry_sample(sample.value)
-                    and sample.updated_at_s is not None
-                    and sample.age_s(self._clock()) is not None
-                    and sample.age_s(self._clock()) <= self.config.odometry_timeout_s
-                )
-            except Exception:
-                manual_encoder_ready = False
         # MANUAL is intentionally independent of navigation odometry.  Pause
         # the producer, and wait for its linearized acknowledgement, before a
         # lease can expose A2 output.  This prevents 0x92 traffic from
         # competing with held web commands rather than merely tolerating a
         # timeout after the fact.
         if manual_source is not None:
-            if not manual_source.pause_for_manual(self.config.odometry_timeout_s):
-                self._fail_closed("ODOMETRY_PAUSE_TIMEOUT")
-                raise ValueError("fysisk odometri kunde inte pausas före MANUAL-armering")
-        if (arming_manual and self._odometry is not None and not manual_encoder_ready
-                and not self._known_right_encoder_timeout_after_left_reply()):
-            # Cold start and every unclassified missing/invalid pair remain
-            # fail-closed. Only the typed right-after-left timeout below has
-            # explicit MANUAL-only authorization.
-            self._fail_closed("ODOMETRY_TIMEOUT")
-            raise ValueError("fysisk odometri är felaktig eller för gammal")
+            manual_source.pause_for_manual(self.config.odometry_timeout_s)
         # AUTO arming retains the established fresh-odometry gate. MANUAL
         # testing is different: its source is paused before output is exposed,
         # so a missing pair cannot block a verified STOP+0x9C arming sequence.
         # Do not hold the lifecycle gate while waiting: close() must be able
         # to stop the source and wake this condition immediately.
-        if isinstance(self._odometry, OdometrySource) and manual_source is None:
-            if not self._odometry.wait_until_ready(self.config.odometry_timeout_s):
-                self._fail_closed("ODOMETRY_TIMEOUT")
-                raise ValueError("fysisk odometri blev inte redo före timeout")
         with self._lifecycle_lock:
             with self._lock:
                 if self._configuration_restart_pending:
@@ -1393,15 +1466,9 @@ class FieldControlRuntime:
                 raise RuntimeError("runtime stängs under odometriförberedelse")
             if self._fault is not None:
                 raise ValueError("runtime har fel före armering")
-            if manual_source is None and not arming_manual:
-                odometry_fault = self._physical_odometry_fault_if_due(self._clock(), require_armed=False)
-                if odometry_fault is not None:
-                    self._fail_closed(odometry_fault)
-                    raise ValueError("fysisk odometri är felaktig eller för gammal")
             token = self.lease.acquire()
             self._arming_in_progress = True
-        recovery_source = (self._odometry if isinstance(self._odometry, OdometrySource)
-                           and manual_source is None else None)
+        recovery_source = None
         if recovery_source is not None:
             # Fence before arm() queues its mandatory STOP.  A pre-existing
             # read is discarded and no next 0x92 reaches the shared worker
@@ -1603,6 +1670,8 @@ class FieldControlRuntime:
         self._clear_stationary_hold_odometry_recovery()
         self._last_command = None
         self._lease_token = None
+        with self._state_lock:
+            self._auto_selected = False
         if self._is_physical_output():
             # A close that has claimed adapter shutdown ownership must be the
             # only physical STOP issuer.  This action only admits queue work;
@@ -1611,6 +1680,56 @@ class FieldControlRuntime:
                 if self._lifecycle is not _Lifecycle.RUNNING:
                     return
         self.motor.stop_all(reason)
+
+    @staticmethod
+    def _operator_recoverable_reason(reason: str) -> bool:
+        """Fault classes explicitly authorized to return to web MANUAL."""
+        return (reason in {"ROW_LOST", CONTROL_LEASE_EXPIRED, "CONTROL_LOOP_STALL"}
+                or reason.startswith("MOTOR_OUTPUT_ERROR:")
+                or reason.startswith("TURN_RUNTIME_ERROR:"))
+
+    def _recover_to_web_manual_standby(self, reason: str, *, fault: bool) -> bool:
+        """Queue zero output and retain only bounded no-motion web standby.
+
+        This is intentionally narrower than ``_stop_motor``.  The verified
+        boundary atomically revokes the old lease before it publishes standby,
+        so no A2 command survives without a fresh manual claim.  Failure to
+        establish that boundary state leaves the caller on the normal
+        fail-closed/disarm path.
+        """
+        # The same RLock serializes MANUAL's selected check -> standby claim
+        # -> A2 admission.  Keep it across both halves of this handoff: once
+        # boundary has revoked the old token and queued STOP, a manual caller
+        # cannot claim the just-published standby before runtime owns its
+        # deadline/state/token view.
+        with self._lifecycle_lock:
+            if not self._is_physical_output():
+                return False
+            recover = getattr(self.motor, "recoverable_stop_to_web_standby", None)
+            if not callable(recover):
+                return False
+            try:
+                if not recover(reason):
+                    return False
+            except Exception:
+                return False
+            hook = self._after_recoverable_boundary_standby
+            if hook is not None:
+                hook()
+            with self._lock:
+                self._lease_token = None
+                self._last_command = None
+                self._web_standby_deadline_s = self._clock() + self.config.physical_web_standby_timeout_s
+            self._clear_stopped_hold()
+            self._clear_stationary_hold_odometry_recovery()
+            self._clear_turn_controller()
+            with self._state_lock:
+                self._auto_selected = False
+                self._temporary_search_heading_deg = None
+                self.machine.select_manual()
+            self.events.record("recoverable_manual_standby", level="WARNING", timestamp_s=self._clock(),
+                               data={"reason": reason, "fault": fault})
+            return True
 
     def _record_admitted_nonzero_command(self, command: WheelCommand) -> None:
         """Retain immutable evidence of a successful nonzero sink admission.
@@ -1647,16 +1766,12 @@ class FieldControlRuntime:
         with self._lock:
             if self._stopped_hold_state is state:
                 return
-        source = self._begin_stationary_hold_odometry_recovery()
         try:
             self._hold_motor_stopped(reason)
         except Exception:
             # Do not remember a hold that failed to enter the boundary.
             self._clear_stopped_hold()
             raise
-        finally:
-            if source is not None:
-                source.finish_stop_recovery()
         with self._lock:
             self._stopped_hold_state = state
 
@@ -1672,6 +1787,7 @@ class FieldControlRuntime:
         # A first fault is the causal diagnostic. Later safety ticks must not
         # overwrite it or trigger a new output-stop sequence.
         with self._state_lock:
+            self._auto_selected = False
             if self._fault is None:
                 self._fault = reason
                 self.machine._fault(reason)
@@ -1680,6 +1796,8 @@ class FieldControlRuntime:
 
     def _fail_closed(self, reason: str, *, output_already_stopped: bool = False) -> None:
         self._record_fault(reason)
+        if self._operator_recoverable_reason(reason) and self._recover_to_web_manual_standby(reason, fault=True):
+            return
         if output_already_stopped:
             return
         hook = self._before_tick_fault_stop
@@ -1693,6 +1811,17 @@ class FieldControlRuntime:
     def select_manual(self) -> None:
         self._cancel_pending_auto_start()
         self._clear_turn_controller()
+        # A recoverable STOP already established verified zero output and
+        # released its drive lease into web standby.  Selecting MANUAL must
+        # not disarm that safe handoff; the first direction command will
+        # claim a fresh bounded lease.
+        if self._is_physical_output() and self._web_standby_active() and getattr(self.motor, "armed", False):
+            with self._state_lock:
+                self._temporary_search_heading_deg = None
+                self._auto_selected = False
+                self.machine.select_manual()
+            self.events.record("mode_manual_selected", timestamp_s=self._clock())
+            return
         try:
             self._stop_motor("MANUAL vald")
         except RuntimeError as exc:
@@ -1704,42 +1833,47 @@ class FieldControlRuntime:
                 raise ValueError("fysisk odometri kunde inte pausas efter MANUAL-STOP")
         with self._state_lock:
             self._temporary_search_heading_deg = None
+            self._auto_selected = False
             self.machine.select_manual()
         self.events.record("mode_manual_selected", timestamp_s=self._clock())
 
     def select_auto(self) -> None:
+        # Serialize selection with MANUAL's check -> standby claim -> A2
+        # admission transaction.  If MANUAL already owns that transaction,
+        # selection must take the ordinary stopped handoff afterwards; if
+        # AUTO wins, MANUAL sees _auto_selected before it can claim output.
+        with self._lifecycle_lock:
+            self._select_auto_serialized()
+
+    def _select_auto_serialized(self) -> None:
         self._cancel_pending_auto_start()
         self._clear_turn_controller()
-        if self._is_physical_output() and self._manual_encoder_degraded_active():
-            # AUTO is never admitted from encoder-degraded MANUAL. Make the
-            # current output safe, release the source so it may recover, and
-            # require the operator to select AUTO again after a fresh pair.
-            source = self._odometry if isinstance(self._odometry, OdometrySource) else None
-            if source is not None:
-                source.begin_stop_recovery()
-            try:
-                self._stop_motor("AUTO nekad: encoderodometri saknas")
-            finally:
-                if source is not None:
-                    source.resume_from_manual()
-                    source.finish_stop_recovery()
-            raise ValueError("AUTO kräver en ny giltig encoderavläsning")
-        # A locally armed physical web deployment must be able to select AUTO
-        # without a browser gaining (or needing) arming authority.  Queue a
-        # verified stopped hold in that one case: it preserves the existing
-        # local lease token while still fencing the shared 0x92 reader until
-        # a replacement sample arrives.  Explicit STOP, faults, watchdog and
-        # shutdown deliberately retain their disarming ``_stop_motor`` path.
+        # Selecting AUTO from physical web standby is intentionally a pure
+        # mode-selection action.  It must neither claim a short drive lease
+        # nor enqueue a motor exchange: the no-motion standby remains valid
+        # until the explicit Start Auto transaction claims it, fences output
+        # with a stopped hold, and enters active AUTO.
+        if self._is_physical_output() and self._web_standby_active():
+            with self._state_lock:
+                self._temporary_search_heading_deg = None
+                self._auto_selected = True
+                self.machine.select_auto()
+            self._reset_degraded_auto_distance(self._clock())
+            self.events.record("mode_auto_selected", timestamp_s=self._clock())
+            return
+        # Encoder replies do not gate mode selection.  MANUAL's source pause
+        # is released only after the mandatory stopped handoff below.
         preserve_local_arm = (self._is_physical_output()
                               and bool(getattr(self.motor, "armed", False))
                               and self._lease_token is not None)
-        source = self._begin_auto_select_odometry_recovery()
+        source = None
         stop_admitted = False
         try:
             if preserve_local_arm:
                 self._hold_motor_stopped("AUTO valt")
             else:
                 self._stop_motor("AUTO valt")
+            self._last_command = None
             stop_admitted = True
         except RuntimeError as exc:
             reason = f"MODE_CHANGE_STOP_FAILURE: {type(exc).__name__}: {exc}"
@@ -1749,19 +1883,19 @@ class FieldControlRuntime:
             self._fail_closed(reason)
             raise
         finally:
-            if source is not None and stop_admitted:
-                source.resume_from_manual()
-                source.finish_stop_recovery()
+            if self._is_physical_output() and isinstance(self._odometry, OdometrySource) and stop_admitted:
+                # MANUAL had fenced 0x92 while it owned held commands.  The
+                # STOP above is now admitted; permit bounded retries again.
+                self._odometry.resume_from_manual()
         with self._state_lock:
             self._temporary_search_heading_deg = None
+            self._auto_selected = True
             self.machine.select_auto()
+        self._reset_degraded_auto_distance(self._clock())
         self.events.record("mode_auto_selected", timestamp_s=self._clock())
 
     def start_auto(self) -> None:
         with self._lifecycle_lock:
-            if self._is_physical_output() and self._manual_encoder_degraded_active():
-                self._stop_motor("AUTO nekad: encoderodometri saknas")
-                raise ValueError("AUTO kräver en ny giltig encoderavläsning")
             if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
                 raise ValueError("runtime stängs")
             start_generation = self._reserve_auto_start()
@@ -1803,13 +1937,15 @@ class FieldControlRuntime:
                 if (not self._auto_start_pending
                         or start_generation != self._auto_start_generation):
                     raise ValueError("AUTO-start avbröts")
-            source = self._begin_auto_start_odometry_recovery()
+            degraded_auto = self._is_physical_output()
+            source = None
             stop_admitted = False
             try:
                 if self._is_physical_output():
                     self._hold_motor_stopped("AUTO startförberedelse")
                 else:
                     self.motor.stop_all("AUTO startförberedelse")
+                self._last_command = None
                 stop_admitted = True
             except RuntimeError as exc:
                 self._fail_closed(f"MOTOR_OUTPUT_ERROR: {type(exc).__name__}: {exc}")
@@ -1818,6 +1954,8 @@ class FieldControlRuntime:
                 if source is not None and stop_admitted:
                     source.resume_from_manual()
                     source.finish_stop_recovery()
+                elif degraded_auto and isinstance(self._odometry, OdometrySource) and stop_admitted:
+                    self._odometry.resume_from_manual()
             if source is not None:
                 self._auto_start_lease_keepalive_pending = True
                 self._auto_start_lease_keepalive_deadline_s = self._auto_start_odometry_recovery_deadline_s
@@ -1870,6 +2008,7 @@ class FieldControlRuntime:
                     False if observation.vision is None else observation.vision.marker_found,
                     observation.distance_m, observation.row_heading_reliable,
                         ))
+                        self._auto_selected = False
                         # The AUTO state and the release of MANUAL's gate are
                         # one control transition.  No manual command can see
                         # a stopped MANUAL state after this point.
@@ -1886,11 +2025,12 @@ class FieldControlRuntime:
         with self._lifecycle_lock:
             self._cancel_pending_auto_start()
             self._clear_turn_controller()
-            try:
-                self._stop_motor("STOP")
-            except RuntimeError as exc:
-                self._record_fault(f"STOP_FAILURE: {type(exc).__name__}: {exc}")
-                raise
+            if not self._recover_to_web_manual_standby("STOP", fault=False):
+                try:
+                    self._stop_motor("STOP")
+                except RuntimeError as exc:
+                    self._record_fault(f"STOP_FAILURE: {type(exc).__name__}: {exc}")
+                    raise
             with self._state_lock:
                 self.machine.stop()
         self.events.record("stop_requested", timestamp_s=self._clock())
@@ -1927,6 +2067,12 @@ class FieldControlRuntime:
                 raise ValueError("runtime stängs")
             if self._arming_in_progress:
                 raise ValueError("manuell styrning väntar på att fysisk armering ska slutföras")
+            with self._state_lock:
+                if self._auto_selected:
+                    raise ValueError("AUTO har valts; välj MANUAL före manuell körning")
+            hook = self._before_manual_standby_claim
+            if hook is not None:
+                hook()
             self._claim_web_standby_if_needed()
             self._manual_command_admitted(command)
 
