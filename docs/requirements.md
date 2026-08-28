@@ -256,7 +256,11 @@ Manuell styrning ska i så stor utsträckning som möjligt återanvända den ver
 
 # 9. Visuell radnavigation
 
-Automatisk radnavigation startas endast där minst ett giltigt navigationsmål finns.
+När ett giltigt navigationsmål finns används visuell radnavigation omedelbart.
+Om AUTO startas med en frisk kamera men utan navigationsmål får systemet i
+stället starta den begränsade IMU-only-körningen enligt avsnitt 12. Detta är
+ett uttryckligt operatörsbeslut och ersätter den tidigare formuleringen att
+AUTO endast fick starta när ett visuellt mål redan fanns.
 
 Konfigurationen ska tillåta två navigationslägen:
 
@@ -341,9 +345,14 @@ Syftet är att undvika snabb oscillering mellan `AUTO_ROW_FOLLOW` och `AUTO_SEAR
 
 # 12. `AUTO_SEARCH`
 
-När visuella navigationsmål saknas men kamera, IMU och odometri fungerar ska roboten fortsätta längs:
+När visuella navigationsmål saknas men kamera, IMU och odometri fungerar ska roboten fortsätta längs en aktiv navigation-referens. En tillförlitlig
+`row_heading_reference` används först. Om en sådan ännu saknas får runtime
+vid inträde i den begränsade sökningen frysa den aktuella filtrerade
+IMU-headingen som en temporär referens.
 
-`row_heading_reference`
+Den temporära referensen är inte en `row_heading_reference`, markerar aldrig
+den visuella referensen som tillförlitlig och kastas när visuell radföljning
+återfångas. Därmed kan ingen IMU-only-körning bli obegränsad eller permanent.
 
 Headingregleringen ska återanvända verifierade principer från `get_heading`.
 
@@ -1047,7 +1056,7 @@ FAULT
 
 `heading_reference_min_distance_m`
 
-giltig visuell körsträcka, eller när den uttryckligen har härletts från en tidigare verifierad radriktning efter en 180-graders turn.
+giltig visuell körsträcka, eller när den uttryckligen har härletts från en tidigare verifierad radriktning efter en 180-graders turn. Den av operatören godkända, temporära IMU-referensen i avsnitt 12 är separat och får endast användas under samma konfigurerade, ändliga `search_length_m`.
 
 ---
 
@@ -1195,7 +1204,7 @@ Webbklientens bortkoppling får aldrig lämna motorerna i ett osäkert tillstån
 
 Startfördröjningen `auto_start_delay_s` får alltid avbrytas med STOP.
 
-Om roboten saknar en tillförlitlig `row_heading_reference` och samtidigt förlorar visuella navigationsmål ska den inte försöka skapa en godtycklig fallback-heading. Den ska stoppa eller gå till ett tydligt fel-/vänteläge beroende på den slutliga state-machine-designen.
+Om roboten saknar en tillförlitlig `row_heading_reference` och samtidigt förlorar visuella navigationsmål ska den inte försöka skapa en godtycklig fallback-heading. Undantaget är den uttryckligen konfigurerade och strängt begränsade AUTO_SEARCH-starten i avsnitt 12: en färsk filtrerad IMU-heading fryses vid övergången, används högst `search_length_m`, och ersätts när visuella mål återfångas. Saknas en sådan färsk IMU-heading ska roboten stoppa och gå till `FAULT`.
 
 ---
 

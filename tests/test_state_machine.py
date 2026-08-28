@@ -28,16 +28,82 @@ class FieldStateMachineTests(unittest.TestCase):
         machine.tick(obs(10.0))
         self.assertEqual(machine.state, State.MANUAL)
 
+    def test_start_without_visual_target_enters_bounded_search(self):
+        machine = FieldStateMachine(SafetyConfig(auto_start_delay_s=0, search_length_m=1.0))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False, distance_m=4.0))
+
+        machine.tick(obs(0, visual_target=False, distance_m=4.0))
+        self.assertEqual(machine.state, State.AUTO_SEARCH)
+        self.assertEqual(machine.snapshot(0).search_distance_m, 0.0)
+
+        machine.tick(obs(1, visual_target=False, distance_m=5.0))
+        self.assertEqual(machine.state, State.FAULT)
+        self.assertEqual(machine.fault, "ROW_LOST")
+
+    def test_start_without_target_enters_bounded_search_without_visual_row_heading(self):
+        machine = FieldStateMachine(SafetyConfig(auto_start_delay_s=0))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False, row_heading_reliable=False))
+
+        machine.tick(obs(0, visual_target=False, row_heading_reliable=False))
+        self.assertEqual(machine.state, State.AUTO_SEARCH)
+
+    def test_start_without_target_at_zero_search_limit_faults_before_motion(self):
+        machine = FieldStateMachine(SafetyConfig(auto_start_delay_s=0, search_length_m=0))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False, distance_m=4.0))
+
+        machine.tick(obs(0, visual_target=False, distance_m=4.0))
+        self.assertEqual(machine.state, State.FAULT)
+        self.assertEqual(machine.fault, "ROW_LOST")
+
+    def test_confirmed_marker_on_initial_no_target_tick_wins_before_search(self):
+        machine = FieldStateMachine(SafetyConfig(
+            auto_start_delay_s=0,
+            turn_marker_confirm_frames=1,
+            in_row_turn_enabled=False,
+            number_of_rows=2,
+        ))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False))
+
+        machine.tick(obs(0, visual_target=False, marker_seen=True))
+        self.assertEqual(machine.state, State.AUTO_NEW_ROW_TURN)
+
+    def test_initial_marker_wins_even_with_zero_imu_search_length(self):
+        machine = FieldStateMachine(SafetyConfig(
+            auto_start_delay_s=0,
+            search_length_m=0,
+            turn_marker_confirm_frames=1,
+            in_row_turn_enabled=False,
+            number_of_rows=2,
+        ))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False))
+
+        machine.tick(obs(0, visual_target=False, marker_seen=True))
+        self.assertEqual(machine.state, State.AUTO_NEW_ROW_TURN)
+
+    def test_start_delay_still_faults_on_stale_sensor_before_search(self):
+        machine = FieldStateMachine(SafetyConfig(auto_start_delay_s=1))
+        machine.select_auto()
+        machine.request_start_auto(obs(0, visual_target=False))
+
+        machine.tick(obs(1, visual_target=False, imu_fresh=False))
+        self.assertEqual(machine.state, State.FAULT)
+        self.assertEqual(machine.fault, "IMU_TIMEOUT")
+
     def test_critical_sensor_failure_faults_active_auto_mode(self):
         machine = self.started()
         machine.tick(obs(1.0, frame_fresh=False))
         self.assertEqual(machine.state, State.FAULT)
         self.assertEqual(machine.fault, "CAMERA_TIMEOUT")
 
-    def test_search_is_bounded_and_requires_reliable_row_heading(self):
+    def test_search_is_bounded_without_visual_row_heading(self):
         machine = self.started(SafetyConfig(auto_start_delay_s=0, navigation_lost_timeout_s=0,
                                             search_length_m=.5))
-        machine.tick(obs(1, visual_target=False, distance_m=1))
+        machine.tick(obs(1, visual_target=False, distance_m=1, row_heading_reliable=False))
         self.assertEqual(machine.state, State.AUTO_SEARCH)
         machine.tick(obs(2, visual_target=False, distance_m=1.5))
         self.assertEqual(machine.state, State.FAULT)

@@ -86,14 +86,35 @@ class VisionProcessor:
                             {"buds": buds, "leaves": leaves, "marker": marker}, overlay)
 
     @staticmethod
+    def draw_zones(image: np.ndarray, config: VisionConfig) -> np.ndarray:
+        """Return a copy with precisely the shared diagnostic zone lines."""
+        image = image.copy(); height, width = image.shape[:2]
+        for zone, colour in ((config.navigation_zone, (255, 180, 0)), (config.trigger_zone, (0, 255, 255)),
+                             (config.pick_zone, (255, 0, 255)), (config.turn_marker_zone, (0, 180, 255))):
+            x0, x1, y0, y1 = zone.pixels(width, height)
+            cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), colour, 1)
+        return image
+
+    @staticmethod
+    def draw_navigation_guides(image: np.ndarray, config: VisionConfig) -> np.ndarray:
+        """Return camera evidence with the shared zones and configured x goal.
+
+        This deliberately excludes segmentation and target annotations.  The
+        Original dashboard view can therefore show its operational reference
+        without pretending that a target was detected.
+        """
+        image = VisionProcessor.draw_zones(image, config)
+        height, width = image.shape[:2]
+        goal = round(config.x_goal * (width - 1))
+        cv2.line(image, (goal, 0), (goal, height - 1), (0, 0, 255), 2)
+        return image
+
+    @staticmethod
     def _overlay(frame: np.ndarray, config: VisionConfig, target_x: float | None,
                  buds: np.ndarray, leaves: np.ndarray, marker: np.ndarray) -> np.ndarray:
         image = frame.copy(); height, width = frame.shape[:2]
         image[leaves == 255] = (0, 220, 0); image[buds == 255] = (230, 0, 230); image[marker == 255] = (0, 180, 255)
-        for zone, colour in ((config.navigation_zone, (255, 180, 0)), (config.trigger_zone, (0, 255, 255)),
-                             (config.pick_zone, (255, 0, 255)), (config.turn_marker_zone, (0, 180, 255))):
-            x0, x1, y0, y1 = zone.pixels(width, height); cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), colour, 1)
-        goal = round(config.x_goal * (width - 1)); cv2.line(image, (goal, 0), (goal, height - 1), (0, 0, 255), 2)
+        image = VisionProcessor.draw_navigation_guides(image, config)
         if target_x is not None:
             cv2.line(image, (round(target_x), 0), (round(target_x), height - 1), (255, 255, 0), 1)
         return image

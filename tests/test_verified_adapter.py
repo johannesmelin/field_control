@@ -5,7 +5,7 @@ from field_control.control import WheelCommand
 from field_control.config import PhysicalCanConfig
 from field_control.lease import ControlLease
 from field_control.motor_boundary import MotorOutputFault, PhysicalOutputDisabled
-from field_control.sources import EncoderReadPreempted
+from field_control.sources import EncoderReadPreempted, RightEncoderReplyTimeout
 from field_control.verified_motor_boundary import _VerifiedPhysicalMotorBoundary, SharedCanEncoderBackend, open_verified_boundary
 
 
@@ -59,6 +59,23 @@ class VerifiedAdapterTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PhysicalCanError, "reply timeout"):
             SharedCanEncoderBackend(FailingSink()).angles()
+
+    def test_shared_encoder_maps_only_exact_right_timeout_after_left_reply(self):
+        from remote_control.physical import PartialLeftAngleReadTimeout, PhysicalCanError
+
+        class RightTimeoutSink(Sink):
+            def read_multi_turn_angles(self):
+                raise PartialLeftAngleReadTimeout("pair timeout", received_reply_ids=(0x141,))
+
+        with self.assertRaises(RightEncoderReplyTimeout):
+            SharedCanEncoderBackend(RightTimeoutSink()).angles()
+
+        class LeftTimeoutSink(Sink):
+            def read_multi_turn_angles(self):
+                raise PartialLeftAngleReadTimeout("pair timeout", received_reply_ids=())
+
+        with self.assertRaises(PhysicalCanError):
+            SharedCanEncoderBackend(LeftTimeoutSink()).angles()
 
     def test_shared_encoder_shutdown_is_non_owning_but_blocks_future_reads(self):
         sink = Sink(); adapter = SharedCanEncoderBackend(sink)

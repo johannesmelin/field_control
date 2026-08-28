@@ -25,6 +25,16 @@ class EncoderReadPreempted(RuntimeError):
     """
 
 
+class RightEncoderReplyTimeout(RuntimeError):
+    """A 0x92 pair received left ``0x141`` but timed out at right ``0x142``.
+
+    This deliberately preserves the one user-authorized degraded-MANUAL case
+    across the latest-value source's otherwise string-only error boundary.
+    All other protocol, timeout, malformed-value, and CAN failures remain
+    ordinary terminal encoder failures.
+    """
+
+
 @dataclass(frozen=True)
 class SourceSnapshot(Generic[ValueT]):
     value: ValueT | None
@@ -168,6 +178,7 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
         # commands.  This acknowledgement is stronger than merely ignoring a
         # stale snapshot: once paused, no 0x92 read is active or can begin.
         self._manual_paused = False
+        self._right_encoder_timeout_after_left_reply = False
         self._read_in_progress = False
         # Arming a physical boundary must wait for an actual encoder sample,
         # not merely for this source thread to have been started.  This is a
@@ -194,7 +205,7 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
     def snapshot(self) -> SourceSnapshot[OdometrySample]:
         """Return one immutable, timestamped latest sample without queueing."""
         snapshot = self.latest.snapshot()
-        if self._fresh_read_required.is_set():
+        if self._fresh_read_required.is_set() or self.right_encoder_timeout_after_left_reply:
             # This is a transient scheduling state, not a terminal sensor
             # error.  Keep ``error`` clear so wait_until_ready() waits for the
             # next fresh 0x92 pair instead of reporting a false hard failure.
@@ -216,10 +227,23 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
                         self._read_in_progress = True
                     try:
                         sample = self._read()
-                    finally:
+                    except RightEncoderReplyTimeout:
+                        # Publish this specific classification before making
+                        # the in-flight read appear quiescent.  A concurrent
+                        # pause_for_manual() is allowed to return as soon as
+                        # ``_read_in_progress`` clears; it must therefore
+                        # never observe an unclassified missing pair and
+                        # incorrectly fail closed.
                         with self._readiness:
+                            self._right_encoder_timeout_after_left_reply = True
                             self._read_in_progress = False
                             self._readiness.notify_all()
+                        raise
+                    finally:
+                        with self._readiness:
+                            if self._read_in_progress:
+                                self._read_in_progress = False
+                                self._readiness.notify_all()
                 except EncoderReadPreempted:
                     # A typed worker signal means an intentional STOP/restart
                     # won arbitration over this *unstarted* 0x92 pair.  It is
@@ -230,6 +254,17 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
                     # over recovery because Event.wait() returns immediately.
                     self._fresh_read_required.set()
                     with self._readiness:
+                        self._readiness.notify_all()
+                    if self._stop.wait(self.SAMPLE_PERIOD_S):
+                        break
+                    continue
+                except RightEncoderReplyTimeout:
+                    # This is the one explicitly accepted degraded-MANUAL
+                    # condition. It remains unavailable to all consumers,
+                    # but retries at the existing bounded source rate so a
+                    # later genuine pair can restore AUTO eligibility.
+                    with self._readiness:
+                        self._right_encoder_timeout_after_left_reply = True
                         self._readiness.notify_all()
                     if self._stop.wait(self.SAMPLE_PERIOD_S):
                         break
@@ -245,17 +280,26 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
                 self.latest.publish(sample, self._sample_acquired_at_s)
                 self._fresh_read_required.clear()
                 with self._readiness:
+                    self._right_encoder_timeout_after_left_reply = False
                     self._readiness.notify_all()
                 self._stop.wait(self.SAMPLE_PERIOD_S)
         except Exception as exc:
             if not self._stop.is_set():
                 # A real later failure must never be hidden behind the
                 # transient preemption state.
+                with self._readiness:
+                    self._right_encoder_timeout_after_left_reply = False
                 self._fresh_read_required.clear()
                 self.latest.fail(f"{type(exc).__name__}: {exc}")
         finally:
             with self._readiness:
                 self._readiness.notify_all()
+
+    @property
+    def right_encoder_timeout_after_left_reply(self) -> bool:
+        """Whether the terminal source error is exactly the known 0x142 case."""
+        with self._readiness:
+            return self._right_encoder_timeout_after_left_reply
 
     def begin_stop_recovery(self) -> None:
         """Invalidate encoder data and hold later reads until STOP is queued.
@@ -330,6 +374,33 @@ class OdometrySource(_ThreadedSource[OdometrySample]):
             while True:
                 snapshot = self.snapshot()
                 if snapshot.connected and isinstance(snapshot.value, OdometrySample):
+                    return True
+                if self._stop.is_set() or snapshot.error is not None:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._readiness.wait(remaining)
+
+    def wait_for_manual_arming_outcome(self, timeout_s: float) -> bool:
+        """Wait for the one bounded encoder outcome permitted before MANUAL.
+
+        A physical MANUAL arm may proceed only after a fresh valid pair or the
+        explicitly-authorized ``0x141``-then-``0x142`` timeout.  This must
+        happen before pausing the source: a cold pause could otherwise
+        suppress the in-flight read that establishes the exact classification.
+        Generic terminal errors and an unknown timeout remain fail-closed.
+        """
+        if (not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool)
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            raise ValueError("odometrins readiness-timeout måste vara positiv")
+        deadline = time.monotonic() + float(timeout_s)
+        with self._readiness:
+            while True:
+                snapshot = self.snapshot()
+                if snapshot.connected and isinstance(snapshot.value, OdometrySample):
+                    return True
+                if self._right_encoder_timeout_after_left_reply:
                     return True
                 if self._stop.is_set() or snapshot.error is not None:
                     return False

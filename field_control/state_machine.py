@@ -146,8 +146,6 @@ class FieldStateMachine:
         self._require_sensors(observation)
         if self.state is not State.MANUAL:
             raise ValueError("Start Auto är bara tillåten från MANUAL")
-        if not observation.visual_target:
-            raise ValueError("Start Auto kräver minst ett giltigt visuellt navigationsmål")
         self._auto_start_at = observation.now_s + self.config.auto_start_delay_s
         self._transition(State.AUTO_START_DELAY, "Automatisk startfördröjning aktiv")
 
@@ -206,13 +204,23 @@ class FieldStateMachine:
                 return self.snapshot(observation.now_s)
         self._update_marker_rearm(observation)
         if self.state is State.AUTO_START_DELAY:
-            if observation.now_s >= (self._auto_start_at or observation.now_s):
-                if observation.visual_target:
-                    self._last_visual_at = observation.now_s
-                    self._transition(State.AUTO_ROW_FOLLOW, "Automatisk radföljning startad")
-                else:
-                    self._fault("START_TARGET_LOST")
-            return self.snapshot(observation.now_s)
+            if observation.now_s < (self._auto_start_at or observation.now_s):
+                return self.snapshot(observation.now_s)
+            if observation.visual_target:
+                self._last_visual_at = observation.now_s
+                self._transition(State.AUTO_ROW_FOLLOW, "Automatisk radföljning startad")
+            else:
+                # A healthy camera without a target is not a sensor failure.
+                # Continue through this tick's marker check before any search
+                # command can be admitted; a confirmed marker always wins.
+                # Runtime captures a fresh filtered IMU heading if there is no
+                # established visual row reference.  The machine deliberately
+                # does not manufacture a heading itself.
+                self._search_started_distance_m = observation.distance_m
+                self._transition(
+                    State.AUTO_SEARCH,
+                    "Inget visuellt mål vid start; headingbaserad sökning",
+                )
         if self.state not in self._ACTIVE:
             return self.snapshot(observation.now_s)
         if self.state in (State.AUTO_IN_ROW_TURN, State.AUTO_NEW_ROW_TURN):
@@ -254,9 +262,6 @@ class FieldStateMachine:
         if self.state is State.AUTO_ROW_FOLLOW and (
             observation.now_s - self._last_visual_at >= self.config.navigation_lost_timeout_s
         ):
-            if not observation.row_heading_reliable:
-                self._fault("ROW_HEADING_UNAVAILABLE")
-                return
             self._search_started_distance_m = observation.distance_m
             self._transition(State.AUTO_SEARCH, "Visuella navigationsmål saknas; headingbaserad sökning")
         if self.state is State.AUTO_SEARCH:
@@ -283,10 +288,7 @@ class FieldStateMachine:
             "Pick-lockout passerad",
         )
         if self.state is State.AUTO_SEARCH:
-            if not observation.row_heading_reliable:
-                self._fault("ROW_HEADING_UNAVAILABLE")
-            else:
-                self._search_started_distance_m = observation.distance_m
+            self._search_started_distance_m = observation.distance_m
 
     def _start_turn(self) -> None:
         if self.config.in_row_turn_enabled and self.pass_number == 1:

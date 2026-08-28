@@ -237,8 +237,8 @@ class RuntimeConfig:
             raise ValueError("maximal styrloopstall måste vara positiv och högst 120 ms")
         if self.control_lease_timeout_s > .300:
             raise ValueError("control-lease-timeout får vara högst 300 ms")
-        if self.physical_web_standby_timeout_s > 60.0:
-            raise ValueError("fysisk webb-standby får vara högst 60 s")
+        if self.physical_web_standby_timeout_s > 180.0:
+            raise ValueError("fysisk webb-standby får vara högst 180 s")
         dimensions = (self.processing_width, self.processing_height, self.stream_width, self.stream_height)
         if any(value < 1 for value in dimensions) or self.jpeg_quality not in range(1, 101):
             raise ValueError("bilddimensioner och JPEG-kvalitet är ogiltiga")

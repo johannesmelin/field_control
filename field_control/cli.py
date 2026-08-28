@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 from pathlib import Path
 import signal
+import sys
 import threading
 from typing import Sequence
 
 from .app import FieldControlApplication
 from .config import RuntimeConfig
 from .config_io import dump_runtime_config, load_runtime_config
+from .config_profiles import default_profiles_dir, load_profile, load_selected_or_latest
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -20,6 +23,7 @@ def _parser() -> argparse.ArgumentParser:
     action.add_argument("--write-default-config", metavar="PATH")
     parser.add_argument("--force", action="store_true", help="allow overwriting --write-default-config target")
     parser.add_argument("--config", metavar="PATH", help="strict JSON config for diagnostics runtime")
+    parser.add_argument("--profile", metavar="NAME", help="operator profile from konfigurationer, applied at this start")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--physical-web", action="store_true",
@@ -58,8 +62,28 @@ def _arm_physical_web_output(application: FieldControlApplication) -> None:
     application.runtime.arm_motor_output_for_web_standby()
 
 
+def _restart_argv(argv: Sequence[str]) -> list[str]:
+    """Retain deployment gates but discard one-run arm/profile overrides."""
+    restarted: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--arm-motor-output" or argument.startswith("--profile="):
+            index += 1
+            continue
+        if argument == "--profile":
+            # argparse requires a following value; omit both so the selected
+            # profile just staged by the web endpoint wins on the next start.
+            index += 2
+            continue
+        restarted.append(argument)
+        index += 1
+    return restarted
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    args = _parser().parse_args(effective_argv)
     if args.force and not args.write_default_config:
         _parser().error("--force kräver --write-default-config")
     if args.confirm_physical_web and not args.physical_web:
@@ -87,7 +111,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _parser().error("normal körning kräver --config PATH")
         if not 1 <= args.port <= 65535:
             raise ValueError("--port måste ligga mellan 1 och 65535")
-        config = load_runtime_config(args.config)
+        # ``--config`` is the deployment envelope.  Profiles can alter only
+        # operator parameters and can never restore physical CAN approvals.
+        deployment = load_runtime_config(args.config)
+        if args.profile:
+            config = load_profile(args.profile, deployment, default_profiles_dir())
+        else:
+            config, _profile_name = load_selected_or_latest(deployment, default_profiles_dir())
         # The ordinary CLI is diagnostics-only.  Physical CAN requires both
         # this distinct opt-in and its own already-validated configuration
         # gates.  A physical listener is intentionally local-only until a
@@ -107,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     application = FieldControlApplication(config, web_host=args.host, web_port=args.port)
     stopping = threading.Event()
+    restart = False
     previous_handlers: dict[int, object] = {}
     def request_stop(_signum, _frame) -> None:
         stopping.set()
@@ -119,7 +150,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.arm_motor_output:
             _arm_physical_web_output(application)
         while not stopping.wait(.2):
-            pass
+            if application.web is not None and application.web.restart_requested():
+                restart = True
+                break
     except KeyboardInterrupt:
         stopping.set()
     except (OSError, ValueError, RuntimeError) as exc:
@@ -131,6 +164,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+    if restart:
+        # A browser restart must never inherit the local arm option.  The
+        # deployment remains explicitly physical-web-confirmed, but begins
+        # disarmed and cannot produce a motor command until a fresh local arm.
+        restart_argv = _restart_argv(effective_argv)
+        os.execv(sys.executable, [sys.executable, "-m", "field_control.cli", *restart_argv])
+        raise RuntimeError("processomstart returnerade oväntat")
     return 0
 
 

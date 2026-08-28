@@ -510,6 +510,39 @@ tal krävs och ogiltiga nested-värden avvisas innan den vanliga
 motorer på egen hand. `imu_sample_hz` är ett positivt heltal (standard `100`)
 och `log_level` är en av `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
 
+### Operatörsprofiler i webbgränssnittet
+
+Dashboardens ruta **Configuration** sparar operatörsparametrar som
+`konfigurationer/konfig_YYYYMMDD_HHMMSS.json`. Sparning och val av profil är
+endast möjligt i `MANUAL`, utan aktiv control-lease och med disarmerad
+motorutgång. Ändringen är alltid staged och börjar gälla först efter nästa
+processstart; den ändrar aldrig en redan körande runtime.
+
+Vid start laddas den senast sparade profilen automatiskt. Väljs en annan profil
+i dashboarden blir den vald för nästa start. `--profile NAMN` väljer i stället
+en bestämd profil för just den processen:
+
+```bash
+field-control --config field_control_deployment.json --profile konfig_20260828_123456.json
+```
+
+`--config` är deployment-konfigurationen. Profiler sparar eller återställer
+aldrig `physical_can`, CAN-enhet eller fysiska bekräftelser, så en sparad
+profil kan inte armera eller återauktorisera motorutgång.
+
+I webbgränssnittet anges samtliga RPM-fält som **hjul-RPM**. De omvandlas exakt
+en gång med `motor_turns_per_wheel_turn` innan den verifierade motorgränsen
+får dem; JSON-filer och intern runtime behåller motor-side RPM. Rutan under
+driftlägesknapparna visar direkt `navigation_mode` (buds only/buds + leaves),
+`search_length_m` (max IMU-only navigation), `max_pick_wait_s`, in-row-turn,
+new-row-riktning och antal rader.
+
+**Reload/restart from configuration** sparar först den visade kandidaten som
+vald profil och gör sedan en kontrollerad processomstart. Knappen kräver
+MANUAL, disarmerad utgång och ingen aktiv lease. Den kan aldrig armera motorer:
+en eventuell lokal `--arm-motor-output`-flagga tas bort före omstart och alla
+vanliga CLI-gates kontrolleras igen.
+
 Ett minimalt säkert JSON-dokument kan lämna fysisk output avstängd:
 
 ```json
@@ -547,7 +580,7 @@ marktest- eller upphissad-hjul-gates), bindning till en numerisk loopback-IP
 och två separata CLI-bekräftelser. Den startar alltid disarmerad; webbläsaren
 kan aldrig armera motorerna. Om lokal armering avsiktligt önskas görs den först
 efter att runtime, watchdog och färsk 0x92-odometri är igång och fortfarande i
-`MANUAL`. Den byts sedan omedelbart till en konfigurerbar (högst 60 s), helt
+`MANUAL`. Den byts sedan omedelbart till en konfigurerbar (högst 180 s), helt
 stillastående webb-standby utan aktiv drive-lease. Första giltiga webbaserade
 MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 300 ms-lease. AUTO-
 valet ensamt kan inte förnya eller ta över den. Timeout, STOP, MANUAL-val,

@@ -6,12 +6,25 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from field_control.cli import main
+from field_control.cli import _restart_argv, main
 from field_control.config import PhysicalCanConfig, RuntimeConfig
 from field_control.config_io import dump_runtime_config
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        """Keep CLI cases independent of an operator's saved profiles."""
+        self._profiles = tempfile.TemporaryDirectory()
+        self._profiles_patch = patch(
+            "field_control.cli.default_profiles_dir",
+            return_value=Path(self._profiles.name),
+        )
+        self._profiles_patch.start()
+
+    def tearDown(self) -> None:
+        self._profiles_patch.stop()
+        self._profiles.cleanup()
+
     @staticmethod
     def physical_config() -> RuntimeConfig:
         return RuntimeConfig(stream_enabled=False, max_rpm=1,
@@ -110,6 +123,33 @@ class CliTests(unittest.TestCase):
                                        "--arm-motor-output"]), 2)
             runtime.arm_motor_output.assert_not_called()
             application.return_value.close.assert_called_once()
+
+    def test_web_requested_restart_closes_then_execs_without_arm_option(self):
+        class RestartWait:
+            def wait(self, _timeout): return False
+            def set(self): pass
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "physical.json"; dump_runtime_config(self.physical_config(), path)
+            with patch("field_control.cli.FieldControlApplication") as application, \
+                 patch("field_control.cli.threading.Event", return_value=RestartWait()), \
+                 patch("field_control.cli.os.execv", side_effect=SystemExit) as execv:
+                application.return_value.web.restart_requested.return_value = True
+                application.return_value.runtime.status.return_value = SimpleNamespace(state="MANUAL", motor_output_armed=False)
+                with self.assertRaises(SystemExit):
+                    main(["--config", str(path), "--physical-web", "--confirm-physical-web", "--arm-motor-output"])
+            application.return_value.close.assert_called_once()
+            argv = execv.call_args.args[1]
+            self.assertNotIn("--arm-motor-output", argv)
+
+    def test_restart_arguments_remove_one_run_profile_in_both_supported_forms(self):
+        self.assertEqual(
+            _restart_argv(["--config", "deployment.json", "--profile", "old.json", "--arm-motor-output"]),
+            ["--config", "deployment.json"],
+        )
+        self.assertEqual(
+            _restart_argv(["--config", "deployment.json", "--profile=old.json"]),
+            ["--config", "deployment.json"],
+        )
 
 
 if __name__ == "__main__":

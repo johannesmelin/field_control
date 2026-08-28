@@ -12,8 +12,9 @@ from typing import Callable, Protocol
 
 from .control import WheelCommand
 from .lease import ControlLease
-from .motor_boundary import MotorBoundary, MotorOutputFault, PhysicalOutputDisabled, VERIFIED_MAX_MOTOR_RPM
-from .sources import EncoderReadPreempted
+from .motor_boundary import (LEFT_ID, MotorBoundary, MotorOutputFault,
+                             PhysicalOutputDisabled, VERIFIED_MAX_MOTOR_RPM)
+from .sources import EncoderReadPreempted, RightEncoderReplyTimeout
 
 
 class VerifiedMotorSink(Protocol):
@@ -77,6 +78,10 @@ class SharedCanEncoderBackend:
                 # transient STOP/restart preemption signal.
                 if _is_remote_angle_read_preempted(exc):
                     raise EncoderReadPreempted("0x92-avläsning preempterades av säkert STOP") from exc
+                if _is_exact_right_encoder_timeout_after_left_reply(exc):
+                    raise RightEncoderReplyTimeout(
+                        "0x92 fick giltigt svar från 0x141 men timeout från 0x142"
+                    ) from exc
                 raise
         if (not isinstance(angles, tuple) or len(angles) != 2
                 or not all(isinstance(item, (int, float)) and not isinstance(item, bool)
@@ -113,6 +118,20 @@ def _is_remote_angle_read_preempted(exc: Exception) -> bool:
     except ImportError:
         return False
     return isinstance(exc, AngleReadPreempted)
+
+
+def _is_exact_right_encoder_timeout_after_left_reply(exc: Exception) -> bool:
+    """Recognize only the user-authorized 0x141-replied/0x142-timeout case.
+
+    ``remote_control`` exposes this one outcome as a public typed exception.
+    Do not treat a text-only CAN error, a left timeout, malformed reply, or
+    any other exception as this narrow degradation.
+    """
+    try:
+        from remote_control.physical import PartialLeftAngleReadTimeout
+    except ImportError:
+        return False
+    return isinstance(exc, PartialLeftAngleReadTimeout) and exc.received_reply_ids == (LEFT_ID,)
 
 
 class _VerifiedPhysicalMotorBoundary:

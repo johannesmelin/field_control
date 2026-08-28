@@ -110,6 +110,12 @@ class ConfigIoTests(unittest.TestCase):
     def test_log_level_is_strict(self):
         with self.assertRaises(ValueError): RuntimeConfig(log_level="verbose").validate()
 
+    def test_physical_web_standby_timeout_allows_180_seconds_only(self):
+        config = RuntimeConfig(physical_web_standby_timeout_s=180.0)
+        self.assertIs(config.validate(), config)
+        with self.assertRaisesRegex(ValueError, "högst 180 s"):
+            RuntimeConfig(physical_web_standby_timeout_s=180.001).validate()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -56,6 +56,11 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
         "can": {"ok": getattr(runtime.motor, "fault_reason", None) is None},
         "control_lease": {"active": runtime.lease.valid(None), "watchdog_timeout_s": runtime.config.control_lease_timeout_s},
         "physical_web_standby": {"active": standby_active, "deadline_monotonic_s": standby_deadline_s},
+        # Configuration values for the manual-web input.  They are
+        # informational only: browser input is still validated at the HTTP
+        # boundary and bounded by the verified motor boundary.
+        "manual_rpm": runtime.config.manual_rpm,
+        "max_rpm": runtime.config.max_rpm,
         "marker_armed": status.snapshot.marker_armed,
         "last_command": None if status.last_command is None else {
             "left_rpm": status.last_command.left_rpm, "right_rpm": status.last_command.right_rpm,
