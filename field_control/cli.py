@@ -145,10 +145,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, request_stop)
         application.start()
-        # No CLI path arms by default.  This explicit local option runs only
-        # after all sources, runtime and independent watchdog are alive.
-        if args.arm_motor_output:
-            _arm_physical_web_output(application)
+        # Physical web deployment itself is explicit local authority: parser
+        # validation requires both --physical-web and
+        # --confirm-physical-web.  Always establish verified no-motion
+        # standby after sources and watchdog are alive; the legacy arm flag
+        # remains accepted for backwards-compatible invocations.
+        if args.physical_web:
+            try:
+                _arm_physical_web_output(application)
+            except (OSError, ValueError, RuntimeError) as exc:
+                # A fresh process must never expose output unless its own
+                # verified STOP+0x9C arm sequence succeeded.  Keep the local
+                # diagnostics server alive, explicitly FAULT/DISARMED, so an
+                # operator can see and request another process restart.
+                application.runtime.record_startup_fault(
+                    f"PHYSICAL_WEB_ARM_FAILURE: {type(exc).__name__}: {exc}")
+                print(f"fysisk webbarmning misslyckades; fortsätter DISARMED: {exc}")
         while not stopping.wait(.2):
             if application.web is not None and application.web.restart_requested():
                 restart = True
@@ -161,6 +173,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         try:
             application.close()
+        except (OSError, RuntimeError) as exc:
+            if not restart:
+                raise
+            # An accepted process restart must not be stranded behind the
+            # old process' bounded close/STOP failure.  That close attempt
+            # still ran; the replacement independently performs its own
+            # verified STOP+0x9C before it can arm physical output.
+            print(f"stängning före programomstart misslyckades: {exc}")
         finally:
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)

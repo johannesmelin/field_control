@@ -282,8 +282,33 @@ class IndependentWatchdogTests(unittest.TestCase):
             self.assertEqual(runtime.machine.state, State.MANUAL)
             self.assertTrue(runtime.motor.armed)
             self.assertTrue(sink.stops)
+            # STOP is idempotent while already armed/tokenless in web
+            # standby; it must not degrade into stop_all/disarm.
+            runtime.stop()
+            self.assertTrue(runtime.motor.armed)
             runtime.manual_command(WheelCommand(3, 3, "after explicit stop"))
             self.assertEqual(sink.commands[-1], (3, 3, "after explicit stop"))
+            runtime.stop()
+            self.assertTrue(runtime.motor.armed)
+            runtime.manual_command(WheelCommand(4, 4, "after active manual stop"))
+            self.assertEqual(sink.commands[-1], (4, 4, "after active manual stop"))
+        finally:
+            runtime.close()
+
+    def test_select_manual_from_active_lease_keeps_armed_and_requires_fresh_claim(self):
+        runtime, sink, _now = self.make_runtime()
+        runtime.start(); runtime.arm_motor_output()
+        try:
+            old_token = runtime._lease_token
+            runtime.manual_command(WheelCommand(5, 5, "active before toggle"))
+            runtime.select_manual()
+            self.assertTrue(runtime.motor.armed)
+            self.assertEqual(runtime.machine.state, State.MANUAL)
+            self.assertIsNone(runtime._lease_token)
+            self.assertFalse(runtime.lease.valid(old_token))
+            runtime.manual_command(WheelCommand(2, 2, "fresh after toggle"))
+            self.assertNotEqual(runtime._lease_token, old_token)
+            self.assertEqual(sink.commands[-1], (2, 2, "fresh after toggle"))
         finally:
             runtime.close()
 

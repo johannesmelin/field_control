@@ -163,6 +163,7 @@ class FieldControlRuntime:
         # can be selected. STOP+0x9C, leases, watchdogs and CAN-TX failures
         # remain owned by the verified motor boundary.
         self._manual_encoder_degraded = False
+        self._manual_transition_pending = False
         # The one authorised degraded physical mode is a typed 0x141 reply
         # followed by a 0x142 timeout.  AUTO may use it for ordinary
         # heading/vision following only; it has no per-wheel feedback and
@@ -221,6 +222,10 @@ class FieldControlRuntime:
         # HTTP handler finishes bounded profile persistence and the CLI owns
         # its normal close/exec sequence.
         self._configuration_restart_pending = False
+        # A browser-accepted application restart is distinct from a staged
+        # configuration restart.  It fences all output authority immediately
+        # while the CLI performs its normal close/exec sequence.
+        self._application_restart_pending = False
         # Physical web deployment releases the ordinary 300 ms drive lease
         # after local arm and retains only this bounded, no-motion handoff.
         # It is never a command admission token.
@@ -264,6 +269,10 @@ class FieldControlRuntime:
             except Exception as cleanup_exc:
                 self._record_fault(f"SENSOR_START_CLEANUP_FAILURE: {type(cleanup_exc).__name__}: {cleanup_exc}")
             raise
+
+    def record_startup_fault(self, reason: str) -> None:
+        """Expose a local startup failure in diagnostics without admitting output."""
+        self._record_fault(reason)
 
     def close(self) -> None:
         """Close deterministically; verified output owns its final STOP settle."""
@@ -838,7 +847,9 @@ class FieldControlRuntime:
                 self._configuration_restart_pending = True
             self._cancel_pending_auto_start()
             self._clear_turn_controller()
-            settle = getattr(self.motor, "stop_and_settle_for_restart", None)
+            settle = getattr(self.motor, "stop_and_settle_for_configuration_restart", None)
+            if not callable(settle):
+                settle = getattr(self.motor, "stop_and_settle_for_restart", None)
             try:
                 if self._is_physical_output() and callable(settle):
                     settle("CONFIGURATION_RESTART")
@@ -846,6 +857,18 @@ class FieldControlRuntime:
                     self._stop_motor("CONFIGURATION_RESTART")
             except Exception as exc:
                 self._record_fault(f"CONFIGURATION_RESTART_STOP_FAILURE: {type(exc).__name__}: {exc}")
+                # A verified physical boundary latches a failed STOP+settle
+                # and consequently refuses every future output command.  It
+                # is then safe to release only the *restart* reservation: the
+                # runtime remains FAULT and the boundary remains disarmed, so
+                # this cannot reopen motor authority.  Do not release the
+                # fence for an arbitrary sink error, where output state is
+                # unknown and the fail-closed reservation must remain.
+                if (self._is_physical_output()
+                        and not bool(getattr(self.motor, "armed", False))
+                        and getattr(self.motor, "fault_reason", None) is not None):
+                    with self._lock:
+                        self._configuration_restart_pending = False
                 return False
             with self._lock:
                 self._lease_token = None
@@ -856,11 +879,59 @@ class FieldControlRuntime:
                 self.machine.stop("Konfigurationsomstart")
             return True
 
+    def begin_application_restart(self) -> None:
+        """Fence authority and queue zero output before process replacement.
+
+        Unlike configuration restart this never waits for a verified settle
+        and never decides whether the CLI may restart.  A close/settle error
+        is recorded fail-closed, while the owner still receives the restart
+        event and the replacement independently verifies its own arm STOP.
+        """
+        with self._lifecycle_lock:
+            with self._lock:
+                if self._application_restart_pending:
+                    return
+                self._application_restart_pending = True
+            self._cancel_pending_auto_start()
+            self._clear_turn_controller()
+            try:
+                if not self._recover_to_web_manual_standby("APPLICATION_RESTART", fault=False):
+                    self._stop_motor("APPLICATION_RESTART")
+            except Exception as exc:
+                self._record_fault(f"APPLICATION_RESTART_STOP_FAILURE: {type(exc).__name__}: {exc}")
+            else:
+                with self._state_lock:
+                    self._auto_selected = False
+                    self.machine.stop("Programomstart")
+            self.events.record("application_restart_fenced", timestamp_s=self._clock())
+
     def cancel_configuration_restart(self) -> None:
         """Release an uncommitted restart reservation after persistence failure."""
         with self._lifecycle_lock:
             with self._lock:
                 self._configuration_restart_pending = False
+
+    def reset_row_progress(self) -> None:
+        """Reset row/pass counters only while no motor authority is active.
+
+        This is an operator bookkeeping action.  It does not issue a motor
+        command, acquire a lease, or alter a running AUTO/turn transaction.
+        """
+        with self._lifecycle_lock:
+            with self._lock:
+                if (self._lifecycle is not _Lifecycle.RUNNING
+                        or self._configuration_restart_pending
+                        or self._auto_start_pending
+                        or self._manual_transition_pending
+                        or self._arming_in_progress
+                        or self._lease_token is not None
+                        or self._position_turn_request is not None):
+                    raise ValueError("radåterställning kräver inaktiv MANUAL")
+            with self._state_lock:
+                if self.machine.state is not State.MANUAL or self._auto_selected:
+                    raise ValueError("radåterställning kräver MANUAL")
+                self.machine.reset_row_progress()
+            self.events.record("row_progress_reset", timestamp_s=self._clock())
 
     def web_standby_status(self) -> tuple[bool, float | None]:
         """Return non-secret physical-web standby state for diagnostics."""
@@ -957,8 +1028,12 @@ class FieldControlRuntime:
         before any standby lease claim, source fence, or STOP admission.
         """
         with self._lock:
+            if self._application_restart_pending:
+                raise ValueError("programomstart väntar")
             if self._configuration_restart_pending:
                 raise ValueError("konfigurationsomstart väntar")
+            if self._manual_transition_pending:
+                raise ValueError("MANUAL väntar på att encoderläsaren pausas")
             if self._auto_start_pending:
                 raise ValueError("AUTO-start pågår redan")
             self._auto_start_pending = True
@@ -1183,7 +1258,7 @@ class FieldControlRuntime:
                 if hook is not None:
                     hook()
                 with self._lifecycle_lock:
-                    if self._configuration_restart_pending:
+                    if self._configuration_restart_pending or self._application_restart_pending:
                         return self.machine.snapshot(now_s)
                     self._position_turn_request = position_begin(
                     left_wheel_degrees=target.left_wheel_degrees,
@@ -1419,7 +1494,7 @@ class FieldControlRuntime:
                     return
                 if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
                     return
-                if self._configuration_restart_pending:
+                if self._configuration_restart_pending or self._application_restart_pending:
                     return
                 self.motor.command(command, token)
                 self._record_admitted_nonzero_command(command)
@@ -1433,7 +1508,7 @@ class FieldControlRuntime:
         """
         with self._lifecycle_lock:
             with self._lock:
-                if self._configuration_restart_pending:
+                if self._configuration_restart_pending or self._application_restart_pending:
                     raise ValueError("konfigurationsomstart väntar")
             if self._lifecycle is not _Lifecycle.RUNNING:
                 raise ValueError("runtime är inte igång för armering")
@@ -1460,7 +1535,7 @@ class FieldControlRuntime:
         # to stop the source and wake this condition immediately.
         with self._lifecycle_lock:
             with self._lock:
-                if self._configuration_restart_pending:
+                if self._configuration_restart_pending or self._application_restart_pending:
                     raise ValueError("konfigurationsomstart väntar")
             if self._lifecycle is not _Lifecycle.RUNNING:
                 raise RuntimeError("runtime stängs under odometriförberedelse")
@@ -1809,8 +1884,23 @@ class FieldControlRuntime:
             self._record_fault(f"{reason}; STOP_FAILURE: {type(exc).__name__}: {exc}")
 
     def select_manual(self) -> None:
-        self._cancel_pending_auto_start()
-        self._clear_turn_controller()
+        self._select_manual_serialized()
+
+    def _select_manual_serialized(self) -> None:
+        # Linearize cancellation *and* publication of the pending encoder
+        # pause with Start Auto's final check -> standby-claim transaction.
+        # A Start Auto reservation which lost this race may therefore never
+        # consume the standby that the MANUAL handoff is about to publish.
+        physical_transition = False
+        with self._lifecycle_lock:
+            self._cancel_pending_auto_start()
+            self._clear_turn_controller()
+            physical_transition = (self._is_physical_output()
+                                   and bool(getattr(self.motor, "armed", False))
+                                   and not self._web_standby_active())
+            if physical_transition:
+                with self._lock:
+                    self._manual_transition_pending = True
         # A recoverable STOP already established verified zero output and
         # released its drive lease into web standby.  Selecting MANUAL must
         # not disarm that safe handoff; the first direction command will
@@ -1822,6 +1912,36 @@ class FieldControlRuntime:
                 self.machine.select_manual()
             self.events.record("mode_manual_selected", timestamp_s=self._clock())
             return
+        # An active AUTO lease is never reused by MANUAL.  Convert it through
+        # the verified zero-output standby handoff, leaving the boundary armed
+        # but tokenless until the next held manual command claims fresh
+        # authority.
+        if physical_transition:
+            try:
+                if self._recover_to_web_manual_standby("MANUAL vald", fault=False):
+                    if isinstance(self._odometry, OdometrySource) and not self._odometry.pause_for_manual(self.config.odometry_timeout_s):
+                        self._fail_closed("ODOMETRY_PAUSE_TIMEOUT")
+                        raise ValueError("fysisk odometri kunde inte pausas efter AUTO-MANUAL-STOP")
+                    self.events.record("mode_manual_selected", timestamp_s=self._clock())
+                    return
+                try:
+                    self._stop_motor("MANUAL vald")
+                except RuntimeError as exc:
+                    self._record_fault(f"MODE_CHANGE_STOP_FAILURE: {type(exc).__name__}: {exc}")
+                    raise
+                if isinstance(self._odometry, OdometrySource):
+                    if not self._odometry.pause_for_manual(self.config.odometry_timeout_s):
+                        self._fail_closed("ODOMETRY_PAUSE_TIMEOUT")
+                        raise ValueError("fysisk odometri kunde inte pausas efter MANUAL-STOP")
+                with self._state_lock:
+                    self._temporary_search_heading_deg = None
+                    self._auto_selected = False
+                    self.machine.select_manual()
+                self.events.record("mode_manual_selected", timestamp_s=self._clock())
+                return
+            finally:
+                with self._lock:
+                    self._manual_transition_pending = False
         try:
             self._stop_motor("MANUAL vald")
         except RuntimeError as exc:
@@ -1846,6 +1966,11 @@ class FieldControlRuntime:
             self._select_auto_serialized()
 
     def _select_auto_serialized(self) -> None:
+        with self._lock:
+            if self._application_restart_pending:
+                raise ValueError("programomstart väntar")
+            if self._manual_transition_pending:
+                raise ValueError("MANUAL väntar på att encoderläsaren pausas")
         self._cancel_pending_auto_start()
         self._clear_turn_controller()
         # Selecting AUTO from physical web standby is intentionally a pure
@@ -1919,7 +2044,13 @@ class FieldControlRuntime:
         hook = self._before_auto_start_transition
         if hook is not None:
             hook()
-        self._claim_web_standby_if_needed()
+        with self._lifecycle_lock:
+            with self._lock:
+                if (not self._auto_start_pending
+                        or start_generation != self._auto_start_generation
+                        or self._manual_transition_pending):
+                    raise ValueError("AUTO-start avbröts")
+            self._claim_web_standby_if_needed()
         if self._arming_in_progress:
             raise ValueError("AUTO väntar på att fysisk armering ska slutföras")
         if self._auto_select_odometry_recovery_pending:
@@ -2059,10 +2190,14 @@ class FieldControlRuntime:
     def manual_command(self, command: WheelCommand) -> None:
         with self._lifecycle_lock:
             with self._lock:
+                if self._application_restart_pending:
+                    raise ValueError("programomstart väntar")
                 if self._configuration_restart_pending:
                     raise ValueError("konfigurationsomstart väntar")
                 if self._auto_start_pending:
                     raise ValueError("AUTO-start väntar på encoderavläsning")
+                if self._manual_transition_pending:
+                    raise ValueError("MANUAL väntar på att encoderläsaren pausas")
             if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
                 raise ValueError("runtime stängs")
             if self._arming_in_progress:

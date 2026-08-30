@@ -19,6 +19,8 @@ class FakeRuntime:
         self.config = SimpleNamespace(manual_rpm=rpm, max_rpm=10.0, stream_fps=5)
         self.commands = []; self.error = error
         self.images = {}
+        self.row_reset_calls = 0
+        self.application_restart_calls = 0
         self._lease_token = None; self._arming_in_progress = False
         self._configuration_restart_pending = False
     def manual_command(self, command):
@@ -28,6 +30,8 @@ class FakeRuntime:
     def select_auto(self): pass
     def start_auto(self): pass
     def stop(self): pass
+    def reset_row_progress(self): self.row_reset_calls += 1
+    def begin_application_restart(self): self.application_restart_calls += 1
     def latest_image(self, view): return self.images.get(view)
     def configuration_restart_safe(self):
         status = self.status()
@@ -48,6 +52,37 @@ class ManualWebTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _manual_rpm_from_query("rpm=5.1", default_rpm=30, max_rpm=40,
                                    motor_turns_per_wheel_turn=8)
+
+    def test_row_progress_reset_route_and_control_button_are_explicit(self):
+        from field_control.web import DASHBOARD_HTML
+
+        runtime = FakeRuntime()
+        status, body = self.request(runtime, "/api/reset-row-progress")
+        self.assertEqual((status, body), (200, {"ok": True}))
+        self.assertEqual(runtime.row_reset_calls, 1)
+        self.assertIn("restartApplicationButton.id='restart-application'", DASHBOARD_HTML)
+        self.assertIn("fetch('/api/application/restart',{method:'POST'})", DASHBOARD_HTML)
+        self.assertIn("resetRowProgressButton.id='reset-row-progress'", DASHBOARD_HTML)
+        self.assertIn("post('/api/reset-row-progress')", DASHBOARD_HTML)
+
+    def test_dashboard_stages_auto_and_turn_wheel_rpm_without_live_mutation(self):
+        from field_control.web import DASHBOARD_HTML
+        self.assertEqual(DASHBOARD_HTML.count('data-staged-rpm="auto_base_rpm"'), 1)
+        self.assertEqual(DASHBOARD_HTML.count('data-staged-rpm="turn_speed_rpm"'), 1)
+        self.assertIn('candidate[el.dataset.stagedRpm]=wheelRpm*gearRatio', DASHBOARD_HTML)
+        self.assertIn("const directPaths=['auto_base_rpm','turn_speed_rpm'", DASHBOARD_HTML)
+        # Wheel RPM 5 with the configured 8:1 motor-to-wheel ratio stages
+        # the motor-side profile value 40, exactly once.
+        self.assertIn('wheelRpm*gearRatio', DASHBOARD_HTML)
+        self.assertIn('grid-template-columns:repeat(3,minmax(0,1fr))', DASHBOARD_HTML)
+        self.assertIn('.compact-status{grid-column:1/-1;grid-row:1}', DASHBOARD_HTML)
+        self.assertIn('main>section.panel{grid-column:3;grid-row:2', DASHBOARD_HTML)
+        self.assertIn('.panel[aria-label="Control"] .manual-controls button{min-height:38px', DASHBOARD_HTML)
+        self.assertIn('.compact-status{padding:9px 12px}', DASHBOARD_HTML)
+        self.assertIn('.compact-status .grid{display:inline-grid;grid-template-columns:repeat(5,minmax(62px,1fr))', DASHBOARD_HTML)
+        self.assertEqual(DASHBOARD_HTML.count('data-staged-value="safety.turn_timeout_s"'), 1)
+        self.assertIn("'safety.turn_timeout_s'", DASHBOARD_HTML)
+        self.assertIn('setPath(candidate,el.dataset.stagedValue,value)', DASHBOARD_HTML)
 
     def test_configuration_api_stages_profile_even_while_auto_is_active(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()
@@ -98,6 +133,25 @@ class ManualWebTests(unittest.TestCase):
             self.assertTrue(payload["restarting"])
             self.assertTrue(server._restart_requested.is_set())
             self.assertEqual(json.loads((Path(tmp) / "selected.json").read_text())["selected"], payload["selected"])
+
+    def test_application_restart_signals_after_response_despite_config_fault_or_reservation(self):
+        runtime = FakeRuntime(); runtime._configuration_restart_pending = True
+        server = object.__new__(DiagnosticsServer); server.runtime = runtime
+        handler = object.__new__(server._handler()); response = []; handler.path = "/api/application/restart"
+        handler.wfile = io.BytesIO(); observed_response = []
+        class ResponseEvent:
+            def set(self): observed_response.append(handler.wfile.getvalue())
+            def is_set(self): return bool(observed_response)
+        server._restart_requested = ResponseEvent()
+        handler.send_response = lambda status, *_args: response.append(status); handler.send_header = lambda *_args: None
+        handler.end_headers = lambda: None; handler.send_error = lambda status, *_args: response.append(status)
+        handler.do_POST()
+
+        self.assertEqual(response, [200])
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {"restarting": True})
+        self.assertEqual(observed_response, [handler.wfile.getvalue()])
+        self.assertEqual(runtime.application_restart_calls, 1)
+        self.assertTrue(server._restart_requested.is_set())
 
     def test_configuration_restart_rejects_armed_or_leased_runtime(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()
@@ -351,6 +405,10 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn("Manual request failed: ${error.message}; STOP sent", DASHBOARD_HTML)
         self.assertIn("/api/manual/hold", DASHBOARD_HTML)
         self.assertIn("function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}", DASHBOARD_HTML)
+        self.assertIn("function stopManualIfActive(){if(manual.active||manual.inFlight||manual.pointerId!==null||manual.path!==null)stopManual();}", DASHBOARD_HTML)
+        self.assertIn("window.addEventListener('blur',stopManualIfActive)", DASHBOARD_HTML)
+        self.assertIn("if(document.hidden)stopManualIfActive()", DASHBOARD_HTML)
+        self.assertNotIn("window.addEventListener('blur',stopManual);", DASHBOARD_HTML)
         self.assertNotIn("/api/arm-motor-output", DASHBOARD_HTML)
 
     def test_dashboard_places_speed_and_manual_controls_in_requested_safe_order(self):

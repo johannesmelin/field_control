@@ -153,6 +153,13 @@ class FieldStateMachine:
         """Caller must issue an immediate verified motor stop before/with this."""
         self._transition(State.MANUAL, reason)
 
+    def reset_row_progress(self) -> None:
+        """Reset only the operator-visible row/pass counters in MANUAL."""
+        if self.state is not State.MANUAL:
+            raise ValueError("radåterställning kräver MANUAL")
+        self.row_number = 1
+        self.pass_number = 1
+
     def complete_turn(self, observation: Observation, succeeded: bool) -> None:
         if self.state not in (State.AUTO_IN_ROW_TURN, State.AUTO_NEW_ROW_TURN):
             raise ValueError("ingen vändning är aktiv")

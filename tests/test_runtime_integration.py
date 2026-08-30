@@ -48,6 +48,43 @@ class RuntimeIntegrationTests(unittest.TestCase):
             runtime._arming_in_progress = True
         self.assertFalse(runtime.configuration_restart_safe())
 
+    def test_row_progress_reset_requires_idle_manual_and_never_claims_output(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False), PassiveSource(), PassiveSource())
+        runtime._lifecycle = _Lifecycle.RUNNING
+        runtime.machine.row_number = 4; runtime.machine.pass_number = 2
+        runtime.reset_row_progress()
+        self.assertEqual((runtime.machine.row_number, runtime.machine.pass_number), (1, 1))
+        self.assertIsNone(runtime._lease_token)
+
+        runtime.machine.row_number = 3; runtime.machine.pass_number = 2
+        runtime._lease_token = runtime.lease.acquire()
+        with self.assertRaisesRegex(ValueError, "inaktiv MANUAL"):
+            runtime.reset_row_progress()
+        self.assertEqual((runtime.machine.row_number, runtime.machine.pass_number), (3, 2))
+        runtime._lease_token = None
+        runtime.machine._transition(State.AUTO_ROW_FOLLOW, "test AUTO")
+        with self.assertRaisesRegex(ValueError, "kräver MANUAL"):
+            runtime.reset_row_progress()
+        self.assertEqual((runtime.machine.row_number, runtime.machine.pass_number), (3, 2))
+        runtime.machine.select_manual()
+        with runtime._state_lock:
+            runtime._auto_selected = True
+        with self.assertRaisesRegex(ValueError, "kräver MANUAL"):
+            runtime.reset_row_progress()
+        self.assertEqual((runtime.machine.row_number, runtime.machine.pass_number), (3, 2))
+        with runtime._state_lock:
+            runtime._auto_selected = False
+        with runtime._lifecycle_lock:
+            runtime._arming_in_progress = True
+        with self.assertRaisesRegex(ValueError, "inaktiv MANUAL"):
+            runtime.reset_row_progress()
+        self.assertEqual((runtime.machine.row_number, runtime.machine.pass_number), (3, 2))
+
     def test_configuration_restart_reservation_blocks_new_motor_authority(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
@@ -68,6 +105,66 @@ class RuntimeIntegrationTests(unittest.TestCase):
             runtime.start_auto()
         runtime.cancel_configuration_restart()
         self.assertTrue(runtime.configuration_restart_safe())
+
+    def test_application_restart_fence_stops_and_rejects_new_manual_auto_or_a2(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = True; self.stops = []; self.commands = []
+            def arm(self, _token): self.armed = True
+            def recoverable_stop_to_web_standby(self, _reason): return False
+            def stop_all(self, reason): self.stops.append(reason)
+            def command(self, command, _token): self.commands.append(command)
+
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING; runtime._lease_token = runtime.lease.acquire()
+        runtime.begin_application_restart()
+
+        self.assertTrue(runtime._application_restart_pending)
+        self.assertEqual(motor.stops, ["APPLICATION_RESTART"])
+        with self.assertRaisesRegex(ValueError, "programomstart väntar"):
+            runtime.manual_command(WheelCommand(1, 1, "must not admit"))
+        with self.assertRaisesRegex(ValueError, "programomstart väntar"):
+            runtime.select_auto()
+        with self.assertRaisesRegex(ValueError, "programomstart väntar"):
+            runtime.start_auto()
+        runtime._admit_command(WheelCommand(1, 1, "must not admit A2"))
+        self.assertEqual(motor.commands, [])
+
+    def test_failed_configuration_restart_releases_only_verified_disarmed_fault_boundary(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class LatchedBoundary:
+            armed = False
+            fault_reason = None
+            def arm(self, _token): pass
+            def stop_and_settle_for_configuration_restart(self, _reason):
+                self.fault_reason = "verified STOP settle failed"
+                raise RuntimeError(self.fault_reason)
+
+        class UnknownBoundary:
+            armed = True
+            fault_reason = None
+            def arm(self, _token): pass
+            def stop_and_settle_for_configuration_restart(self, _reason):
+                raise RuntimeError("unknown output state")
+
+        safe = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=LatchedBoundary())
+        self.assertFalse(safe.reserve_configuration_restart())
+        self.assertFalse(safe._configuration_restart_pending)
+        self.assertEqual(safe.machine.state, State.FAULT)
+
+        unsafe = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=UnknownBoundary())
+        self.assertFalse(unsafe.reserve_configuration_restart())
+        self.assertTrue(unsafe._configuration_restart_pending)
+        self.assertEqual(unsafe.machine.state, State.FAULT)
 
     def test_configuration_restart_blocks_a2_after_pre_admission_pause(self):
         class PassiveSource:
@@ -93,6 +190,61 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse(command.is_alive())
         self.assertEqual(runtime.motor.commands, [])
         self.assertEqual(runtime.motor.settles, ["CONFIGURATION_RESTART"])
+
+    def test_auto_to_manual_blocks_manual_claim_until_encoder_pause_ack(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+        class Physical:
+            def __init__(self): self.armed = True; self.commands = []; self.stops = []
+            def arm(self, _token): pass
+            def recoverable_stop_to_web_standby(self, reason): self.stops.append(reason); return True
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, reason): self.armed = False; self.stops.append(reason)
+
+        entered, release, errors = threading.Event(), threading.Event(), []
+        odometry = OdometrySource(Angles(), DriveGeometry())
+        odometry.pause_for_manual = lambda _timeout: (entered.set(), release.wait(.5), True)[2]
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=Physical(), odometry=odometry)
+        runtime._lifecycle = _Lifecycle.RUNNING; runtime._lease_token = runtime.lease.acquire()
+        selecting = threading.Thread(target=lambda: self._capture(runtime.select_manual, errors), daemon=True)
+        selecting.start(); self.assertTrue(entered.wait(.2))
+        with self.assertRaisesRegex(ValueError, "encoderläsaren pausas"):
+            runtime.manual_command(WheelCommand(1, 1, "must wait"))
+        with self.assertRaisesRegex(ValueError, "encoderläsaren pausas"):
+            runtime.select_auto()
+        with self.assertRaisesRegex(ValueError, "encoderläsaren pausas"):
+            runtime.start_auto()
+        self.assertEqual(runtime.motor.commands, [])
+        release.set(); selecting.join(.5)
+        self.assertEqual(errors, [])
+
+    def test_auto_to_manual_pause_timeout_disarms_and_rejects_manual(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+        class Physical:
+            def __init__(self): self.armed = True
+            def arm(self, _token): pass
+            def recoverable_stop_to_web_standby(self, _reason): return True
+            def stop_all(self, _reason): self.armed = False
+
+        odometry = OdometrySource(Angles(), DriveGeometry()); odometry.pause_for_manual = lambda _timeout: False
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=Physical(), odometry=odometry)
+        runtime._lifecycle = _Lifecycle.RUNNING; runtime._lease_token = runtime.lease.acquire()
+        with self.assertRaisesRegex(ValueError, "kunde inte pausas"):
+            runtime.select_manual()
+        self.assertFalse(runtime.motor.armed)
+        with self.assertRaises(ValueError):
+            runtime.manual_command(WheelCommand(1, 1, "must reject"))
 
     def test_imu_only_search_freezes_current_heading_separately_from_visual_reference(self):
         class PassiveSource:
@@ -556,6 +708,64 @@ class RuntimeIntegrationTests(unittest.TestCase):
         starter.join(.5)
         self.assertEqual(errors, [])
         self.assertEqual(runtime.machine.state, State.AUTO_START_DELAY)
+
+    def test_auto_to_manual_cancels_pre_reserved_start_before_standby_claim(self):
+        """A cancelled Start Auto cannot consume MANUAL's new web standby."""
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self):
+                self.armed = True; self.commands = []; self.claims = 0; self.recoveries = []
+            def arm(self, _token): self.armed = True
+            def recoverable_stop_to_web_standby(self, reason):
+                self.recoveries.append(reason); return True
+            def claim_web_standby(self, _token): self.claims += 1
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, _reason): self.armed = False
+
+        odometry = OdometrySource(Angles(), DriveGeometry())
+        pause_entered, release_pause = threading.Event(), threading.Event()
+        odometry.pause_for_manual = lambda _timeout: (pause_entered.set(), release_pause.wait(.5), True)[2]
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(),
+                                      motor=motor, odometry=odometry)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        runtime._lease_token = runtime.lease.acquire()
+        target = type("Vision", (), {"target_x": 10.0, "bud_in_trigger_zone": False,
+                                      "bud_in_pick_zone": False, "marker_found": False})()
+        observation = Observation(0.0, target, None, None, False, None, None, None, 0.0,
+                                  True, True, True)
+        runtime._observation = observation
+        # Establish active AUTO without invoking the unrelated sensor-gate
+        # conversion; this regression exercises only the lifecycle race.
+        runtime.machine._transition(State.AUTO_ROW_FOLLOW, "test AUTO")
+
+        start_entered, release_start, start_errors, manual_errors = (
+            threading.Event(), threading.Event(), [], [])
+        runtime._before_auto_start_transition = lambda: (start_entered.set(), release_start.wait(.5))
+        starter = threading.Thread(target=lambda: self._capture(runtime.start_auto, start_errors), daemon=True)
+        starter.start(); self.assertTrue(start_entered.wait(.2))
+        manual = threading.Thread(target=lambda: self._capture(runtime.select_manual, manual_errors), daemon=True)
+        manual.start(); self.assertTrue(pause_entered.wait(.2))
+
+        release_start.set(); starter.join(.5)
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(len(start_errors), 1)
+        self.assertIsInstance(start_errors[0], ValueError)
+        self.assertEqual(motor.claims, 0)
+        self.assertEqual(motor.commands, [])
+        self.assertIsNone(runtime._lease_token)
+
+        release_pause.set(); manual.join(.5)
+        self.assertFalse(manual.is_alive())
+        self.assertEqual(manual_errors, [])
 
     def test_stop_keeps_manual_behind_cancel_and_stop_admission(self):
         """A MANUAL command cannot enter after STOP cancels pending AUTO first."""

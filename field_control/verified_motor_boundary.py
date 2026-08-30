@@ -305,6 +305,21 @@ class _VerifiedPhysicalMotorBoundary:
             self._latch_fault(f"STOP+0x9C-settle misslyckades: {exc}")
             raise MotorOutputFault(self._fault_reason or "STOP+0x9C-settle misslyckades") from exc
 
+    def stop_and_settle_for_configuration_restart(self, reason: str = "CONFIGURATION_RESTART") -> None:
+        """One bounded delayed re-check before restart is declared unsafe."""
+        self.stop_all(reason)
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                self._sink.stop_and_settle_for_restart()
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(.075)
+        self._latch_fault(f"konfigurationsomstart STOP+0x9C-settle misslyckades: {last_error}")
+        raise MotorOutputFault(self._fault_reason or "konfigurationsomstart STOP+0x9C-settle misslyckades") from last_error
+
     def stop_all(self, reason: str) -> None:
         with self._lock:
             self._armed_token = None
@@ -352,9 +367,22 @@ class _VerifiedPhysicalMotorBoundary:
         if not isinstance(reason, str) or not reason:
             raise ValueError("återställningsstopp kräver orsak")
         with self._lock:
-            if (self._closing or self._closed or self._fault_reason is not None
-                    or (self._armed_token is None and not self._web_standby)):
+            if self._closing or self._closed or self._fault_reason is not None:
                 return False
+            if self._web_standby and self._armed_token is None:
+                # Already no-motion and tokenless: an explicit repeated STOP
+                # remains a physical zero request but must not fall through
+                # to stop_all/disarm merely because there is no lease left to
+                # revoke.
+                already_standby = True
+            elif self._armed_token is None:
+                return False
+            else:
+                already_standby = False
+            if already_standby:
+                self._sink.stop_all(reason)
+                self.events.append(("recoverable-stop", 0.0, 0.0, reason))
+                return True
             self._recoverable_revoke_reason = reason
         if self._lease.revoke_any():
             with self._lock:

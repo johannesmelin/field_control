@@ -42,6 +42,18 @@ class VerifiedAdapterTests(unittest.TestCase):
         self.assertEqual(adapter.angles(), (12.5, -6.25))
         adapter.close(); self.assertFalse(sink.closed)
 
+    def test_configuration_restart_rechecks_one_transient_settle_timeout(self):
+        class FlakySink(Sink):
+            def stop_and_settle_for_restart(self):
+                self.settles += 1
+                if self.settles == 1:
+                    raise RuntimeError("motor did not reach 0 dps")
+
+        sink = FlakySink(); boundary = _VerifiedPhysicalMotorBoundary(sink, ControlLease(1.0), max_rpm=20)
+        boundary.stop_and_settle_for_configuration_restart()
+        self.assertEqual(sink.settles, 2)
+        self.assertIsNone(boundary.fault_reason)
+
     def test_shared_encoder_maps_only_remote_typed_stop_preemption(self):
         from remote_control.physical import AngleReadPreempted
 

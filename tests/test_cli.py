@@ -82,7 +82,7 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(main(argv), 2)
                     application.assert_not_called()
 
-    def test_physical_web_starts_disarmed_without_local_arm_option(self):
+    def test_physical_web_arms_no_motion_standby_without_legacy_arm_option(self):
         class ImmediateStop:
             def wait(self, _timeout): return True
             def set(self): pass
@@ -90,9 +90,10 @@ class CliTests(unittest.TestCase):
             path = Path(directory) / "physical.json"; dump_runtime_config(self.physical_config(), path)
             with patch("field_control.cli.FieldControlApplication") as application, \
                  patch("field_control.cli.threading.Event", return_value=ImmediateStop()):
+                application.return_value.runtime.status.return_value = SimpleNamespace(state="MANUAL", motor_output_armed=False)
                 self.assertEqual(main(["--config", str(path), "--physical-web", "--confirm-physical-web"]), 0)
             application.return_value.start.assert_called_once()
-            application.return_value.runtime.arm_motor_output.assert_not_called()
+            application.return_value.runtime.arm_motor_output_for_web_standby.assert_called_once()
             application.return_value.close.assert_called_once()
 
     def test_physical_web_arm_is_local_and_after_started_manual_runtime(self):
@@ -113,15 +114,20 @@ class CliTests(unittest.TestCase):
             self.assertEqual(calls, ["start", "standby"])
             application.return_value.close.assert_called_once()
 
-    def test_physical_web_arm_rejection_closes_application(self):
+    def test_physical_web_arm_rejection_keeps_diagnostics_disarmed(self):
+        class StopSoon:
+            def wait(self, _timeout): return True
+            def set(self): pass
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "physical.json"; dump_runtime_config(self.physical_config(), path)
-            with patch("field_control.cli.FieldControlApplication") as application:
+            with patch("field_control.cli.FieldControlApplication") as application, \
+                 patch("field_control.cli.threading.Event", return_value=StopSoon()):
                 runtime = application.return_value.runtime
                 runtime.status.return_value = SimpleNamespace(state="AUTO_ROW_FOLLOW", motor_output_armed=False)
                 self.assertEqual(main(["--config", str(path), "--physical-web", "--confirm-physical-web",
-                                       "--arm-motor-output"]), 2)
-            runtime.arm_motor_output.assert_not_called()
+                                       "--arm-motor-output"]), 0)
+            runtime.arm_motor_output_for_web_standby.assert_not_called()
+            runtime.record_startup_fault.assert_called_once()
             application.return_value.close.assert_called_once()
 
     def test_web_requested_restart_closes_then_execs_without_arm_option(self):
@@ -140,6 +146,37 @@ class CliTests(unittest.TestCase):
             application.return_value.close.assert_called_once()
             argv = execv.call_args.args[1]
             self.assertIn("--arm-motor-output", argv)
+
+    def test_web_requested_restart_execs_even_when_old_close_reports_stop_failure(self):
+        class RestartWait:
+            def wait(self, _timeout): return False
+            def set(self): pass
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "physical.json"; dump_runtime_config(self.physical_config(), path)
+            with patch("field_control.cli.FieldControlApplication") as application, \
+                 patch("field_control.cli.threading.Event", return_value=RestartWait()), \
+                 patch("field_control.cli.os.execv", side_effect=SystemExit) as execv:
+                application.return_value.web.restart_requested.return_value = True
+                application.return_value.runtime.status.return_value = SimpleNamespace(state="MANUAL", motor_output_armed=False)
+                application.return_value.close.side_effect = RuntimeError("verified close settle failed")
+                with self.assertRaises(SystemExit):
+                    main(["--config", str(path), "--physical-web", "--confirm-physical-web"])
+            execv.assert_called_once()
+
+    def test_physical_web_arm_failure_keeps_diagnostics_running_disarmed(self):
+        class StopSoon:
+            def wait(self, _timeout): return True
+            def set(self): pass
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "physical.json"; dump_runtime_config(self.physical_config(), path)
+            with patch("field_control.cli.FieldControlApplication") as application, \
+                 patch("field_control.cli.threading.Event", return_value=StopSoon()):
+                runtime = application.return_value.runtime
+                runtime.status.return_value = SimpleNamespace(state="MANUAL", motor_output_armed=False)
+                runtime.arm_motor_output_for_web_standby.side_effect = RuntimeError("STOP settle failed")
+                self.assertEqual(main(["--config", str(path), "--physical-web", "--confirm-physical-web"]), 0)
+            runtime.record_startup_fault.assert_called_once()
+            application.return_value.close.assert_called_once()
 
     def test_restart_arguments_remove_one_run_profile_in_both_supported_forms(self):
         self.assertEqual(

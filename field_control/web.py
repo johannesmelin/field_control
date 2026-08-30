@@ -119,6 +119,26 @@ class DiagnosticsServer:
             def do_POST(self) -> None:
                 request = urlsplit(self.path)
                 path = request.path
+                if path == "/api/application/restart":
+                    if request.query:
+                        self._conflict("programomstart accepterar inga parametrar"); return
+                    # This deliberately bypasses profile parsing and the
+                    # configuration-restart reservation.  The CLI owns the
+                    # following close/STOP attempts and process replacement;
+                    # write the response first so a slow close cannot make
+                    # the browser mistake an accepted restart for failure.
+                    self._json({"restarting": True})
+                    fence = getattr(runtime, "begin_application_restart", None)
+                    # The fence is deliberately best-effort from HTTP's
+                    # perspective: it latches any STOP failure itself, and
+                    # an accepted process restart must still reach the CLI's
+                    # close/exec owner.
+                    event = getattr(owner, "_restart_requested", None)
+                    try:
+                        if callable(fence): fence()
+                    finally:
+                        if event is not None: event.set()
+                    return
                 if path in ("/api/config/save", "/api/config/select", "/api/config/restart"):
                     restart_reserved = False
                     try:
@@ -218,6 +238,7 @@ class DiagnosticsServer:
                     "/api/manual": runtime.select_manual,
                     "/api/auto": runtime.select_auto,
                     "/api/start-auto": runtime.start_auto,
+                    "/api/reset-row-progress": runtime.reset_row_progress,
                     "/api/stop": runtime.stop,
                 }
                 action = actions.get(path)
@@ -331,17 +352,37 @@ DASHBOARD_HTML = """<!doctype html>
 const text=(id,value)=>document.getElementById(id).textContent=value??'-';
 const fmt=(value,suffix='')=>value===null||value===undefined?'-':Number(value).toFixed(2)+suffix;
 const rpmInput=document.getElementById('rpm');
+const controlActions=document.querySelector('.mode-actions');
+const restartApplicationButton=document.createElement('button');
+restartApplicationButton.id='restart-application';
+restartApplicationButton.textContent='Restart application';
+const resetRowProgressButton=document.createElement('button');
+resetRowProgressButton.id='reset-row-progress';
+resetRowProgressButton.textContent='Reset row/pass';
+controlActions.after(restartApplicationButton,resetRowProgressButton);
+document.querySelector('section.panel h2').insertAdjacentHTML('afterend','<p class="label" id="navigation-state">Loading navigation state…</p>');
+rpmInput.previousElementSibling.textContent='Manual speed (wheel RPM)';
+rpmInput.insertAdjacentHTML('afterend','<label class="label" for="auto-rpm">Auto speed (wheel RPM, applies on restart)</label><input class="speed-input" id="auto-rpm" data-staged-rpm="auto_base_rpm" type="number" min="0.01" step="0.1" inputmode="decimal"><label class="label" for="turn-rpm">Turn speed (wheel RPM, applies on restart)</label><input class="speed-input" id="turn-rpm" data-staged-rpm="turn_speed_rpm" type="number" min="0.01" step="0.1" inputmode="decimal"><label class="label" for="turn-timeout">Turn timeout (s, applies on restart)</label><input class="speed-input" id="turn-timeout" data-staged-value="safety.turn_timeout_s" type="number" min="0.1" step="0.1" inputmode="decimal">');
+const stagedSpeedRow=document.createElement('div'),manualSpeedLabel=document.querySelector('label[for="rpm"]');stagedSpeedRow.className='staged-speed-row';rpmInput.parentNode.insertBefore(stagedSpeedRow,manualSpeedLabel);for(const [heading,id] of [['Manual','rpm'],['Auto','auto-rpm'],['Turn','turn-rpm']]){const input=document.getElementById(id),label=document.querySelector(`label[for="${id}"]`),cell=document.createElement('div');cell.innerHTML=`<h3>${heading}</h3>`;cell.append(label,input);if(id==='turn-rpm'){const timeout=document.getElementById('turn-timeout'),timeoutLabel=document.querySelector('label[for="turn-timeout"]');cell.append(timeoutLabel,timeout);}stagedSpeedRow.append(cell);}
+document.head.insertAdjacentHTML('beforeend','<style>.config-fields{grid-template-columns:repeat(3,minmax(0,1fr))}@media(max-width:1180px){.config-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.config-fields{grid-template-columns:1fr}}</style>');
+document.head.insertAdjacentHTML('beforeend','<style>.staged-speed-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:8px 0}.staged-speed-row h3{margin:0 0 2px;font-size:12px;color:#173d3a}.staged-speed-row label{font-size:10px}.staged-speed-row .speed-input{margin:2px 0 5px}@media(max-width:760px){.staged-speed-row{grid-template-columns:1fr}}</style>');
+document.head.insertAdjacentHTML('beforeend','<style>.compact-status{padding:9px 12px}.compact-status h2{display:inline;margin:0 10px 0 0;font-size:13px}.compact-status h3{display:inline;margin:0 5px 0 10px;font-size:10px}.compact-status .grid{display:inline-grid;grid-template-columns:repeat(5,minmax(62px,1fr));gap:3px;vertical-align:middle}.compact-status .metric{display:inline-block;border:0;padding:0 4px}.compact-status .label{font-size:8px}.compact-status .value{font-size:11px}.compact-status .fault{display:inline;margin:0 4px;font-size:9px;min-height:0}@media(max-width:1180px){.compact-status h3{display:block;margin:7px 0 2px}.compact-status .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}}</style>');
+document.head.insertAdjacentHTML('beforeend','<style>@media(min-width:1181px){main{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(330px,1fr) minmax(420px,1.35fr);gap:16px;align-items:start}.control-layout{display:contents}.compact-status{grid-column:1/-1;grid-row:1}.panel[aria-label="Control"]{grid-column:1;grid-row:2;padding:12px}.panel[aria-label="Configuration"]{grid-column:2;grid-row:2}.panel[aria-label="Control"] .mode-actions button,.panel[aria-label="Control"] .manual-controls button{min-height:38px;padding:7px 9px;font-size:12px}.panel[aria-label="Control"] .speed-input{margin:2px 0 7px;padding:5px;font-size:12px}main>section.panel{grid-column:3;grid-row:2;margin-top:0!important}.streams{grid-template-columns:1fr 1fr}.streams img{max-height:220px}}</style>');
 // The status endpoint reports motor-side RPM while this control deliberately
 // displays wheel-side RPM.  Do not initialise the control until the selected
 // profile has supplied its verified motor-to-wheel ratio.
 let speedInitialized=false, profileCandidate=null, gearRatio=null, manualSpeedStatus=null, dashboardInstanceId=null;
-const directPaths=['vision.navigation_mode','vision.x_goal','safety.search_length_m','safety.max_pick_wait_s','safety.in_row_turn_enabled','safety.new_row_turn_direction','safety.number_of_rows'];
+const directPaths=['auto_base_rpm','turn_speed_rpm','safety.turn_timeout_s','vision.navigation_mode','vision.x_goal','safety.search_length_m','safety.max_pick_wait_s','safety.in_row_turn_enabled','safety.new_row_turn_direction','safety.number_of_rows'];
 function atPath(value,path){return path.split('.').reduce((v,k)=>v?.[k],value)}
 function setPath(value,path,next){const keys=path.split('.');let target=value;for(const key of keys.slice(0,-1))target=target[key];target[keys.at(-1)]=next;}
 function leafEntries(value,prefix=''){if(Array.isArray(value))return [[prefix,value.join(',')]];if(value&&typeof value==='object')return Object.entries(value).flatMap(([key,item])=>leafEntries(item,prefix?`${prefix}.${key}`:key));return [[prefix,value]];}
 function isRpmPath(path){return path.endsWith('_rpm');}
 function renderConfig(candidate){profileCandidate=candidate;const ratio=Number(candidate.odometry_geometry?.motor_turns_per_wheel_turn);gearRatio=Number.isFinite(ratio)&&ratio>0?ratio:null;document.querySelectorAll('[data-direct]').forEach(el=>{const value=atPath(candidate,el.dataset.direct);if(el.type==='checkbox')el.checked=Boolean(value);else el.value=value??'';});const root=document.getElementById('config-fields');root.textContent='';for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path))continue;const label=document.createElement('label');label.textContent=isRpmPath(path)?`${path} (wheel RPM)`:path;const input=document.createElement('input');input.dataset.path=path;input.value=value===null?'':String(isRpmPath(path)?Number(value)/gearRatio:value);input.type=typeof value==='boolean'?'checkbox':'text';if(input.type==='checkbox')input.checked=value;label.append(input);root.append(label);}if(manualSpeedStatus)configureManualSpeed(manualSpeedStatus);}
 function candidateFromForm(){const candidate=structuredClone(profileCandidate);document.querySelectorAll('[data-direct]').forEach(el=>setPath(candidate,el.dataset.direct,el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value)));document.querySelectorAll('#config-fields input').forEach(el=>{const old=atPath(candidate,el.dataset.path);let value=el.type==='checkbox'?el.checked:el.value;if(Array.isArray(old))value=value.split(',').map(Number);else if(typeof old==='number')value=Number(value);else if(old===null&&value==='')value=null;if(isRpmPath(el.dataset.path))value*=gearRatio;setPath(candidate,el.dataset.path,value);});return candidate;}
+const candidateFromFormBase=candidateFromForm;
+candidateFromForm=()=>{const candidate=candidateFromFormBase();document.querySelectorAll('[data-staged-rpm]').forEach(el=>{const wheelRpm=Number(el.value);if(!Number.isFinite(wheelRpm)||wheelRpm<=0)throw new Error('Staged wheel RPM must be positive');candidate[el.dataset.stagedRpm]=wheelRpm*gearRatio;});document.querySelectorAll('[data-staged-value]').forEach(el=>{const value=Number(el.value);if(!Number.isFinite(value)||value<=0)throw new Error('Staged value must be positive');setPath(candidate,el.dataset.stagedValue,value);});return candidate;};
+const renderConfigBase=renderConfig;
+renderConfig=candidate=>{renderConfigBase(candidate);document.querySelectorAll('[data-staged-rpm]').forEach(el=>{const motorRpm=Number(candidate[el.dataset.stagedRpm]);el.value=Number.isFinite(motorRpm)&&gearRatio?String(motorRpm/gearRatio):'';});document.querySelectorAll('[data-staged-value]').forEach(el=>{const value=atPath(candidate,el.dataset.stagedValue);el.value=value??'';});};
 async function loadConfig(){try{const response=await fetch('/api/config',{cache:'no-store'});if(!response.ok)throw new Error();const data=await response.json();renderConfig(data.candidate);const select=document.getElementById('profile-select');select.textContent='';for(const name of data.profiles){const option=document.createElement('option');option.value=name;option.textContent=name;if(name===data.selected)option.selected=true;select.append(option);}}catch(_){text('config-note','Configuration unavailable');}}
 document.getElementById('save-config').addEventListener('click',async()=>{try{const response=await fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate:candidateFromForm()})});const data=await response.json();if(!response.ok)throw new Error(data.error);text('config-note',`Saved ${data.saved}; applies on restart`);loadConfig();}catch(error){text('config-note',`Save failed: ${error.message}`);}});
 document.getElementById('select-config').addEventListener('click',async()=>{try{const response=await fetch('/api/config/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('profile-select').value})});const data=await response.json();if(!response.ok)throw new Error(data.error);text('config-note',`Selected ${data.selected}; applies on restart`);}catch(error){text('config-note',`Selection failed: ${error.message}`);}});
@@ -367,6 +408,7 @@ async function reconnectAfterRestart(previousInstanceId){
   }
   text('config-note','Restart is taking longer than expected. Reload the page when the application is available.');
   document.getElementById('restart-config').disabled=false;
+  restartApplicationButton.disabled=false;
 }
 document.getElementById('restart-config').addEventListener('click',async()=>{try{const button=document.getElementById('restart-config');button.disabled=true;const previousStatus=dashboardInstanceId?{instance_id:dashboardInstanceId}:await restartStatus();if(!previousStatus?.instance_id)throw new Error('Could not identify the running application');const response=await fetch('/api/config/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({candidate:candidateFromForm()})});const data=await response.json();if(!response.ok)throw new Error(data.error);text('config-note',`Restarting with ${data.selected}; reconnecting automatically…`);void reconnectAfterRestart(previousStatus.instance_id);}catch(error){text('config-note',`Restart failed: ${error.message}`);document.getElementById('restart-config').disabled=false;}});
 function configureManualSpeed(status){
@@ -392,15 +434,19 @@ async function post(path){try{const r=await fetch(path,{method:'POST'});const p=
 // commands.  Pointer release changes to a lease-refreshing zero command;
 // explicit STOP, loss of page visibility and failed delivery remain hard
 // stop/disarm actions. Runtime-side lease expiry is the independent backstop.
+restartApplicationButton.addEventListener('click',async()=>{try{restartApplicationButton.disabled=true;const previousStatus=dashboardInstanceId?{instance_id:dashboardInstanceId}:await restartStatus();if(!previousStatus?.instance_id)throw new Error('Could not identify the running application');const response=await fetch('/api/application/restart',{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error);text('config-note','Restarting application; reconnecting automatically…');void reconnectAfterRestart(previousStatus.instance_id);}catch(error){text('config-note',`Restart failed: ${error.message}`);restartApplicationButton.disabled=false;}});
+resetRowProgressButton.addEventListener('click',async()=>{if(await post('/api/reset-row-progress'))refresh();});
 const manual={active:false,path:null,pointerId:null,timer:null,inFlight:false,controller:null,stopping:false};
 function clearManualTimer(){if(manual.timer!==null){clearInterval(manual.timer);manual.timer=null;}}
 function stopManual(){manual.active=false;manual.path=null;manual.pointerId=null;clearManualTimer();if(manual.controller)manual.controller.abort();if(manual.stopping)return;manual.stopping=true;fetch('/api/stop',{method:'POST'}).then(async r=>{if(!r.ok){const p=await r.json().catch(()=>({}));throw new Error(p.error||'STOP rejected')}}).catch(()=>{text('fault','Manual STOP request failed; runtime lease will stop output')}).finally(()=>{manual.stopping=false;});}
+function stopManualIfActive(){if(manual.active||manual.inFlight||manual.pointerId!==null||manual.path!==null)stopManual();}
 function sendManual(){if(!manual.active||manual.inFlight||manual.stopping)return;let path;try{path=manualRequestPath(manual.path)}catch(error){text('fault',`Manual request failed: ${error.message}; STOP sent`);stopManual();return;}manual.inFlight=true;manual.controller=new AbortController();fetch(path,{method:'POST',signal:manual.controller.signal}).then(async r=>{if(!r.ok){const p=await r.json().catch(()=>({}));throw new Error(p.error||'Manual command rejected')}}).catch(error=>{if(error.name!=='AbortError'){text('fault',`Manual request failed: ${error.message}; STOP sent`);stopManual();}}).finally(()=>{manual.inFlight=false;manual.controller=null;});}
 function holdManual(path,pointerId){if(manual.active&&manual.pointerId!==null&&manual.pointerId!==pointerId)stopManual();manual.active=true;manual.path=path;manual.pointerId=pointerId;sendManual();clearManualTimer();manual.timer=setInterval(sendManual,100);}
 function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}
 document.querySelectorAll('[data-manual-path]').forEach(button=>{const down=e=>{e.preventDefault();button.setPointerCapture?.(e.pointerId);holdManual(button.dataset.manualPath,e.pointerId)};const up=e=>{e.preventDefault();releaseManual(e.pointerId)};button.addEventListener('pointerdown',down);['pointerup','pointercancel','pointerleave'].forEach(event=>button.addEventListener(event,up));});
-document.getElementById('stop').addEventListener('click',stopManual);window.addEventListener('blur',stopManual);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopManual()});
+document.getElementById('stop').addEventListener('click',stopManual);window.addEventListener('blur',stopManualIfActive);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopManualIfActive()});
 async function refresh(){try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();if(typeof p.instance_id==='string')dashboardInstanceId=p.instance_id;const manualReady=p.mode==='MANUAL'&&p.physical_web_standby.active;configureManualSpeed(p);text('state',p.state);text('state2',p.state);text('mode',p.mode);text('row',`${p.row_number} / ${p.pass_number}`);text('armed',p.motor_output_armed?'ARMED':'DISARMED');text('standby',p.physical_web_standby.active?'READY (no motion)':'-');document.getElementById('manual-mode').disabled=manualReady;text('manual-help',manualReady?'Manual is already ready. Hold a direction button; do not press MANUAL.':'Select MANUAL before using a direction button. Hold a manual button to drive.');text('fault',p.fault||'');text('odometry-warning','');text('camera',p.camera.ok?'OK':'FAULT');text('imu',p.imu.ok?'OK':'FAULT');text('camera-age',fmt(p.camera.age_s,' s'));text('imu-age',fmt(p.imu.age_s,' s'));text('heading',fmt(p.heading.filtered_heading_deg,' deg'));text('reference',fmt(p.heading.row_heading_reference_deg,' deg'));text('heading-error',fmt(p.heading.heading_error_deg,' deg'));text('build-distance',fmt(p.heading.reference_build_distance_m,' m'));text('target',`${fmt(p.vision.target_x_px,' px')} / ${fmt(p.vision.x_goal_px,' px')}`);text('marker',p.vision.marker_found?'FOUND':'-');text('distance',fmt(p.odometry.distance_m,' m'));text('search',fmt(p.search_distance_m,' m'));}catch(e){text('fault','Diagnostics unavailable')}}
+const refreshBase=refresh;refresh=async()=>{await refreshBase();try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();const state=p.state;if(state==='MANUAL')text('navigation-state',p.mode==='AUTO'?'AUTO selected — press Start Auto':'MANUAL');else if(state==='AUTO_ROW_FOLLOW')text('navigation-state',p.navigation_mode==='buds_and_leaves'?'AUTO buds + leaves navigation':'AUTO bud navigation');else if(state==='AUTO_SEARCH')text('navigation-state','AUTO IMU-only navigation');else if(state==='AUTO_IN_ROW_TURN')text('navigation-state','In-row turn');else if(state==='AUTO_NEW_ROW_TURN')text('navigation-state','New-row turn');else if(state==='AUTO_PICK')text('navigation-state','Pick active');else if(state==='AUTO_POST_PICK')text('navigation-state','Post-pick navigation');else if(state==='AUTO_START_DELAY')text('navigation-state','AUTO start delay');else if(state==='AUTO_COMPLETE')text('navigation-state','AUTO complete');else if(state==='FAULT')text('navigation-state',`FAULT: ${p.fault||p.state_reason||''}`);else text('navigation-state',state);}catch(_){}};
 refresh();setInterval(refresh,1000);
 loadConfig();
 // VS Code SSH forwarding can buffer multipart MJPEG responses.  Polling

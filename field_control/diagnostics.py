@@ -22,6 +22,7 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
     return {
         "running": status.running,
         "mode": status.mode,
+        "navigation_mode": getattr(runtime.config.vision, "navigation_mode", "buds_only"),
         "state": status.state,
         "state_reason": status.snapshot.reason,
         "fault": status.fault or status.snapshot.fault,
