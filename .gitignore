@@ -6,4 +6,5 @@ __pycache__/
 .mypy_cache/
 field_control_web_test.json
 konfigurationer/*.json
+diagnostics/*.json
 =
