@@ -460,8 +460,34 @@ class ManualWebTests(unittest.TestCase):
     def test_dashboard_configuration_panel_is_restart_staged_and_has_save_select(self):
         from field_control.web import DASHBOARD_HTML
         for item in ("/api/config", "/api/config/save", "/api/config/select", "/api/config/restart", "apply on restart",
-                     "Reload/restart from configuration", "vision.x_goal", "motor_turns_per_wheel_turn", "acceleration is fixed and verified"):
+                     "Reload/restart from configuration", "motor_turns_per_wheel_turn", "acceleration is fixed and verified"):
             self.assertIn(item, DASHBOARD_HTML)
+
+    def test_dashboard_groups_all_configuration_fields_without_hiding_them(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # The section renderer still iterates the complete staged profile;
+        # only the already visible direct-control fields are excluded here.
+        self.assertIn("for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path))continue;", DASHBOARD_HTML)
+        self.assertIn("groups.get(configGroupForPath(path)).append(label);", DASHBOARD_HTML)
+        self.assertIn("const configGroups=[", DASHBOARD_HTML)
+        for group in (
+            "Radmål och zoner", "Bild, HSV och perspektiv",
+            "Navigation och reglering", "Skörd och vändningar",
+            "Odometri och geometri", "Kamera och bildström",
+            "Allmänt och gränser",
+        ):
+            self.assertIn(group, DASHBOARD_HTML)
+        # These are representative fields from every profile area, including
+        # both row targets and the common turn-marker zone.
+        for field in (
+            "x_goal(?:_2)?", "navigation_zone(?:_2)?", "trigger_zone(?:_2)?",
+            "pick_zone(?:_2)?", "turn_marker_zone", "first_crop",
+            "odometry_geometry", "stream_", r"safety\.",
+        ):
+            self.assertIn(field, DASHBOARD_HTML)
+        self.assertIn("class=\"config-sections\"", DASHBOARD_HTML)
+        self.assertIn("class=\"config-profile-actions\"", DASHBOARD_HTML)
 
     def test_dashboard_restart_waits_for_process_replacement_before_reload(self):
         from field_control.web import DASHBOARD_HTML
