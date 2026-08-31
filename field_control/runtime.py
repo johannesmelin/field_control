@@ -226,10 +226,10 @@ class FieldControlRuntime:
         # configuration restart.  It fences all output authority immediately
         # while the CLI performs its normal close/exec sequence.
         self._application_restart_pending = False
-        # Physical web deployment releases the ordinary 300 ms drive lease
-        # after local arm and retains only this bounded, no-motion handoff.
-        # It is never a command admission token.
-        self._web_standby_deadline_s: float | None = None
+        # Physical web deployment releases the ordinary drive lease after
+        # local arm and retains an indefinite, no-motion handoff. It is never
+        # a command admission token; MANUAL/Start Auto claim a fresh lease.
+        self._web_standby = False
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -375,8 +375,6 @@ class FieldControlRuntime:
                 self._clear_turn_controller()
                 return self.status()
         now = self._clock()
-        if self._expire_web_standby_if_due(now):
-            return self.status()
         with self._lock:
             self._last_control_heartbeat_s = now
         if self._arming_in_progress:
@@ -461,7 +459,7 @@ class FieldControlRuntime:
                 from .vision import VisionProcessor
                 self.vision_processor = VisionProcessor()
             self._vision = self.vision_processor.process(frame, camera.updated_at_s or now, self.config.vision)
-            self._frame = frame
+            self._frame = self._vision.raw_frame
             self._last_frame_timestamp = camera.updated_at_s
         odometry_snapshot = self._odometry_snapshot(now)
         sensor = build_observation(
@@ -577,11 +575,9 @@ class FieldControlRuntime:
         """Independent monotonic watchdog; it only revokes/queues STOP."""
         while not self._stop.wait(self.config.watchdog_period_s):
             now = self._clock()
-            if self._expire_web_standby_if_due(now):
-                continue
             if self._web_standby_active():
                 # Standby intentionally has no ordinary drive lease and no
-                # control-loop command heartbeat.  Its own deadline above is
+                # control-loop command heartbeat.  Its no-motion boundary is
                 # the authority, not CONTROL_LEASE_EXPIRED/stall.  Continue
                 # checking physical health while it remains no-motion.
                 motor_fault = getattr(self.motor, "fault_reason", None)
@@ -872,7 +868,7 @@ class FieldControlRuntime:
                 return False
             with self._lock:
                 self._lease_token = None
-                self._web_standby_deadline_s = None
+                self._web_standby = False
                 self._last_command = None
             with self._state_lock:
                 self._auto_selected = False
@@ -936,24 +932,16 @@ class FieldControlRuntime:
     def web_standby_status(self) -> tuple[bool, float | None]:
         """Return non-secret physical-web standby state for diagnostics."""
         with self._lock:
-            deadline = self._web_standby_deadline_s
-        return deadline is not None, deadline
+            active = self._web_standby
+        return active, None
 
     def _web_standby_active(self) -> bool:
         with self._lock:
-            return self._web_standby_deadline_s is not None
+            return self._web_standby
 
     def _clear_web_standby(self) -> None:
         with self._lock:
-            self._web_standby_deadline_s = None
-
-    def _expire_web_standby_if_due(self, now_s: float) -> bool:
-        with self._lock:
-            deadline = self._web_standby_deadline_s
-        if deadline is None or now_s < deadline:
-            return False
-        self._fail_closed("WEB_STANDBY_TIMEOUT")
-        return True
+            self._web_standby = False
 
     def _odometry_snapshot(self, now_s: float) -> SourceSnapshot[OdometrySample | float | int]:
         if self._odometry is None:
@@ -1367,9 +1355,14 @@ class FieldControlRuntime:
                 overlay = getattr(observation.vision, "overlay", None)
                 width = (overlay.shape[1] if getattr(overlay, "shape", None) is not None
                          else self.config.processing_width)
+                height = (overlay.shape[0] if getattr(overlay, "shape", None) is not None
+                          else self.config.processing_height)
+                target_y = getattr(observation.vision, "target_y", None)
+                master_row = getattr(observation.vision, "master_row", None) or 1
+                goal_y = height - 1 if target_y is None else target_y
                 command = vision_command(
                     observation.vision.target_x or 0.0,
-                    self.config.vision.x_goal * width,
+                    self.config.vision.goal_x_normalized(goal_y, height, master_row) * width,
                     self.config.auto_base_rpm, self.config.vision_kp,
                     self.config.vision_deadband_px, self.config.max_vision_correction_rpm,
                     self.config.max_rpm,
@@ -1437,7 +1430,7 @@ class FieldControlRuntime:
             with self._state_lock:
                 self._temporary_search_heading_deg = None
             return True
-        if current is State.AUTO_SEARCH and previous is not State.AUTO_SEARCH:
+        if current in (State.AUTO_SEARCH, State.AUTO_POST_PICK) and previous is not current:
             if observation.row_heading_reliable and observation.row_heading_reference_deg is not None:
                 with self._state_lock:
                     self._temporary_search_heading_deg = None
@@ -1601,7 +1594,7 @@ class FieldControlRuntime:
                 self._arming_in_progress = False
 
     def arm_motor_output_for_web_standby(self) -> None:
-        """Locally arm, then relinquish drive authority into bounded standby.
+        """Locally arm, then relinquish drive authority into no-motion standby.
 
         The regular arm path supplies its verified STOP+0x9C and fresh 0x92
         gates.  The resulting ordinary lease is released, never extended;
@@ -1627,12 +1620,12 @@ class FieldControlRuntime:
                 enter(token)
                 self._lease_token = None
                 with self._lock:
-                    self._web_standby_deadline_s = self._clock() + self.config.physical_web_standby_timeout_s
+                    self._web_standby = True
         except Exception:
             self._stop_motor("fysisk webbstandby misslyckades")
             raise
         finally:
-            # The standby deadline has been published (or a fail-closed STOP
+            # The no-motion standby has been published (or a fail-closed STOP
             # has been queued) before ordinary watchdog/tick admission may
             # resume.  This is deliberately not a general watchdog bypass.
             self._arming_in_progress = False
@@ -1641,8 +1634,6 @@ class FieldControlRuntime:
         """Atomically exchange no-motion standby for one fresh drive lease."""
         if not self._web_standby_active():
             return
-        if self._expire_web_standby_if_due(self._clock()):
-            raise ValueError("fysisk webbstandby har löpt ut")
         with self._state_lock:
             if self.machine.state is not State.MANUAL:
                 raise ValueError("fysisk webbstandby kräver MANUAL")
@@ -1650,28 +1641,21 @@ class FieldControlRuntime:
         if not callable(claim):
             self._fail_closed("WEB_STANDBY_INTERFACE_ERROR")
             raise ValueError("motorgränsen saknar webbstandby")
-        expired = False
         with self._lifecycle_lock:
             with self._lock:
-                deadline = self._web_standby_deadline_s
-            if deadline is None:
+                standby = self._web_standby
+            if not standby:
                 raise ValueError("fysisk webbstandby är inte längre tillgänglig")
-            if self._clock() >= deadline:
-                expired = True
-            elif self._lifecycle is not _Lifecycle.RUNNING:
+            if self._lifecycle is not _Lifecycle.RUNNING:
                 raise ValueError("fysisk webbstandby är inte längre tillgänglig")
-            else:
-                token = self.lease.acquire()
-                try:
-                    claim(token)
-                except Exception:
-                    self.lease.revoke_any()
-                    raise
-                self._lease_token = token
-                self._clear_web_standby()
-        if expired:
-            self._fail_closed("WEB_STANDBY_TIMEOUT")
-            raise ValueError("fysisk webbstandby har löpt ut")
+            token = self.lease.acquire()
+            try:
+                claim(token)
+            except Exception:
+                self.lease.revoke_any()
+                raise
+            self._lease_token = token
+            self._clear_web_standby()
 
     def _refresh_active_lease(self, state: State) -> None:
         if not self._is_physical_output() or state not in FieldStateMachine._ACTIVE:
@@ -1764,7 +1748,7 @@ class FieldControlRuntime:
                 or reason.startswith("TURN_RUNTIME_ERROR:"))
 
     def _recover_to_web_manual_standby(self, reason: str, *, fault: bool) -> bool:
-        """Queue zero output and retain only bounded no-motion web standby.
+        """Queue zero output and retain only no-motion web standby.
 
         This is intentionally narrower than ``_stop_motor``.  The verified
         boundary atomically revokes the old lease before it publishes standby,
@@ -1794,7 +1778,7 @@ class FieldControlRuntime:
             with self._lock:
                 self._lease_token = None
                 self._last_command = None
-                self._web_standby_deadline_s = self._clock() + self.config.physical_web_standby_timeout_s
+                self._web_standby = True
             self._clear_stopped_hold()
             self._clear_stationary_hold_odometry_recovery()
             self._clear_turn_controller()

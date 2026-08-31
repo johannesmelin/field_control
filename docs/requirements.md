@@ -292,6 +292,7 @@ och används för P-reglering av motorerna.
 Följande ska vara konfigurerbart:
 
 * `x_goal`
+* `x_goal_2`
 * `vision_kp`
 * `vision_deadband_px`
 * `max_vision_correction_rpm`
@@ -691,8 +692,11 @@ Diagnostiken ska vara avsedd för praktisk felsökning under fälttest.
 Följande zoner ska finnas:
 
 * `navigation_zone`
+* `navigation_zone_2`
 * `trigger_zone`
+* `trigger_zone_2`
 * `pick_zone`
+* `pick_zone_2`
 * `turn_marker_zone` om den används
 
 Varje zon definieras av:
@@ -1244,8 +1248,8 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | `vision_kp`                   | P-faktor för bildbaserad styrning. Avgör hur kraftigt motorhastigheterna korrigeras utifrån `x_error`.                               |
 | `vision_deadband_px`          | Om absolutvärdet av `x_error` är mindre än detta antal pixlar görs ingen styrkorrigering.                                            |
 | `max_vision_correction_rpm`   | Maximalt tillåten differentialkorrektion i rpm från den visuella regulatorn.                                                         |
-| `x_goal`                      | Den x-position i den processade bilden där navigationsmålet ska ligga.                                                               |
-| `x_filter_window_frames`      | Antal giltiga bildmätningar som används för tidsmässigt glidande medelvärde av `target_x`.                                           |
+| `x_goal` / `x_goal_2`         | x-positionerna för rad 1 respektive rad 2 i den processade bilden. Rad 1 är master när båda har giltigt mål; annars används rad 2. |
+| `x_filter_window_frames`      | Antal giltiga bildmätningar per rad som används för tidsmässigt glidande medelvärde av dess `target_x`; historiker får inte delas. |
 | `x_outlier_threshold_px`      | Gräns för hur kraftigt en ny x-mätning får avvika innan den eventuellt ignoreras som outlier. Funktionen kan initialt vara avstängd. |
 | `navigation_lost_timeout_s`   | Hur länge giltiga visuella navigationsmål får saknas innan systemet går till `AUTO_SEARCH`.                                          |
 | `navigation_reacquire_frames` | Antal konsekutiva giltiga detektioner som krävs innan systemet återgår från `AUTO_SEARCH` till visuell radföljning.                  |
@@ -1338,9 +1342,13 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | `marker_hsv_high` | Övre HSV-gräns för detektion av vändmarkören.  |
 | `marker_min_area` | Minsta accepterade bildarea för en vändmarkör. |
 
-## 41.11 `navigation_zone`
+## 41.11 `navigation_zone` och `navigation_zone_2`
 
 Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
+`navigation_zone` tillhör rad 1 och `navigation_zone_2` rad 2. Varje zon
+genererar sitt eget visuella mål; rad 1 väljs deterministiskt när båda är
+giltiga, annars väljs rad 2. Om inget mål finns gäller den vanliga IMU-only
+fallbacken.
 
 | Parameter               | Förklaring                                                       |
 | ----------------------- | ---------------------------------------------------------------- |
@@ -1349,7 +1357,10 @@ Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
 | `navigation_zone.y_min` | Övre gräns för området som används för visuell radnavigation.    |
 | `navigation_zone.y_max` | Nedre gräns för området som används för visuell radnavigation.   |
 
-## 41.12 `trigger_zone`
+## 41.12 `trigger_zone` och `trigger_zone_2`
+
+Det finns en triggerzon per rad. En knopp i **endera** zonen ska aktivera
+triggern; det finns ingen delad triggerzon.
 
 | Parameter            | Förklaring                                                         |
 | -------------------- | ------------------------------------------------------------------ |
@@ -1358,7 +1369,10 @@ Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
 | `trigger_zone.y_min` | Övre gräns för triggerområdet.                                     |
 | `trigger_zone.y_max` | Nedre gräns för triggerområdet.                                    |
 
-## 41.13 `pick_zone`
+## 41.13 `pick_zone` och `pick_zone_2`
+
+Det finns en pickzon per rad. En knopp i **endera** zonen räknas som knopp i
+pickområdet under `AUTO_PICK`.
 
 | Parameter         | Förklaring                                                 |
 | ----------------- | ---------------------------------------------------------- |
@@ -1377,6 +1391,7 @@ Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
 | `turn_marker_zone.y_max` | Nedre gräns för området där vändmarkörer söks.   |
 
 `turn_marker_zone` kan vara valfri om hela bilden ska användas för markördetektion.
+Den är gemensam för båda raderna och får inte dupliceras per rad.
 
 ## 41.15 Manuell körning
 
@@ -1426,6 +1441,7 @@ vision_deadband_px
 max_vision_correction_rpm
 
 x_goal
+x_goal_2
 x_filter_window_frames
 x_outlier_threshold_px
 
@@ -1479,8 +1495,11 @@ marker_hsv_high
 marker_min_area
 
 navigation_zone
+navigation_zone_2
 trigger_zone
+trigger_zone_2
 pick_zone
+pick_zone_2
 turn_marker_zone
 
 manual_rpm

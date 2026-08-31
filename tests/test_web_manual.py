@@ -76,13 +76,37 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn('wheelRpm*gearRatio', DASHBOARD_HTML)
         self.assertIn('grid-template-columns:repeat(3,minmax(0,1fr))', DASHBOARD_HTML)
         self.assertIn('.compact-status{grid-column:1/-1;grid-row:1}', DASHBOARD_HTML)
-        self.assertIn('main>section.panel{grid-column:3;grid-row:2', DASHBOARD_HTML)
+        self.assertIn('.tab-pane>section.panel{grid-column:2/-1;grid-row:2', DASHBOARD_HTML)
         self.assertIn('.panel[aria-label="Control"] .manual-controls button{min-height:38px', DASHBOARD_HTML)
         self.assertIn('.compact-status{padding:9px 12px}', DASHBOARD_HTML)
         self.assertIn('.compact-status .grid{display:inline-grid;grid-template-columns:repeat(5,minmax(62px,1fr))', DASHBOARD_HTML)
         self.assertEqual(DASHBOARD_HTML.count('data-staged-value="safety.turn_timeout_s"'), 1)
         self.assertIn("'safety.turn_timeout_s'", DASHBOARD_HTML)
         self.assertIn('setPath(candidate,el.dataset.stagedValue,value)', DASHBOARD_HTML)
+
+    def test_dashboard_names_goal_relative_zone_width_without_legacy_x_bounds(self):
+        from field_control.web import DASHBOARD_HTML
+        self.assertIn("x distance from x goal", DASHBOARD_HTML)
+        self.assertIn("navigation|trigger|pick", DASHBOARD_HTML)
+
+    def test_dashboard_places_configuration_in_a_scoped_tab_layout(self):
+        from field_control.web import DASHBOARD_HTML
+        self.assertIn("controlTab.className='tab-pane active'", DASHBOARD_HTML)
+        self.assertIn("configurationTab.className='tab-pane'", DASHBOARD_HTML)
+        self.assertIn("controlTab.append(controlLayout,liveViews)", DASHBOARD_HTML)
+        self.assertIn("configurationTab.append(configurationPanel)", DASHBOARD_HTML)
+        self.assertIn(".tab-pane.active{display:grid", DASHBOARD_HTML)
+        self.assertNotIn("@media(min-width:1181px){main{display:grid", DASHBOARD_HTML)
+
+    def test_dashboard_migrates_only_centred_legacy_navigation_zones(self):
+        from field_control.web import DASHBOARD_HTML
+        self.assertIn("const goalRelativeZoneMigrationTolerance=1e-6;", DASHBOARD_HTML)
+        self.assertIn("function migrateCentredLegacyZones(candidate)", DASHBOARD_HTML)
+        self.assertIn("Math.abs(midpoint-goal)>goalRelativeZoneMigrationTolerance", DASHBOARD_HTML)
+        self.assertIn("vision[key]={x_distance:(zone.x_max-zone.x_min)/2,y_min:zone.y_min,y_max:zone.y_max};", DASHBOARD_HTML)
+        self.assertIn("for(const name of ['navigation','trigger','pick'])", DASHBOARD_HTML)
+        self.assertNotIn("['navigation','trigger','pick','turn_marker']", DASHBOARD_HTML)
+        self.assertIn("candidate=migrateCentredLegacyZones(candidate);profileCandidate=candidate;", DASHBOARD_HTML)
 
     def test_configuration_api_stages_profile_even_while_auto_is_active(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()

@@ -122,6 +122,16 @@ class FieldStateMachineTests(unittest.TestCase):
         machine.tick(obs(5, distance_m=1.5))
         self.assertEqual(machine.state, State.AUTO_ROW_FOLLOW)
 
+    def test_post_pick_lockout_exits_to_search_without_visual_target(self):
+        machine = self.started(SafetyConfig(auto_start_delay_s=0, pick_clear_time_s=1,
+                                            post_pick_lockout_distance_m=.5))
+        machine.tick(obs(1, bud_in_trigger_zone=True, bud_in_pick_zone=True))
+        machine.tick(obs(2, bud_in_pick_zone=False, distance_m=1))
+        machine.tick(obs(3.1, bud_in_pick_zone=False, distance_m=1))
+        self.assertEqual(machine.state, State.AUTO_POST_PICK)
+        machine.tick(obs(4, bud_in_trigger_zone=True, visual_target=False, distance_m=1.5))
+        self.assertEqual(machine.state, State.AUTO_SEARCH)
+
     def test_marker_requires_consecutive_frames_and_counts_unique_rows(self):
         config = SafetyConfig(auto_start_delay_s=0, turn_marker_confirm_frames=2,
                               in_row_turn_enabled=False, number_of_rows=1)

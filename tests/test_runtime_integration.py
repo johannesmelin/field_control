@@ -3,7 +3,7 @@ import threading
 import time
 import io
 
-from field_control.config import PhysicalCanConfig, RuntimeConfig
+from field_control.config import PhysicalCanConfig, RuntimeConfig, VisionConfig
 from field_control.control import WheelCommand
 from field_control.heading import RowHeadingReference
 from field_control.observation import (HeadingProcessor, ImuReading, Observation, build_observation,
@@ -328,6 +328,66 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(motor.commands), 1)
         self.assertGreater(motor.commands[0].left_rpm, 0.0)
         self.assertGreater(motor.commands[0].right_rpm, 0.0)
+
+    def test_auto_post_pick_dispatches_heading_fallback_and_visual_navigation(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class RecordingMotor:
+            armed = True
+            def __init__(self): self.commands = []
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, _reason): pass
+            def hold_stopped(self, _reason, _token=None): pass
+
+        motor = RecordingMotor()
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False, search_speed_rpm=5.0,
+                                                     auto_base_rpm=5.0, vision_kp=1.0, max_rpm=10.0),
+                                      PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        heading = Observation(0.0, None, 85.0, None, False, None, None, None, 0.0,
+                              True, True, True)
+        self.assertTrue(runtime._synchronize_navigation_reference(
+            State.AUTO_PICK, State.AUTO_POST_PICK, heading))
+        runtime._dispatch_command(heading, State.AUTO_POST_PICK)
+        vision = type("Vision", (), {"target_x": 14.0,
+                  "overlay": type("Overlay", (), {"shape": (20, 20)})()})()
+        following = Observation(0.1, vision, 85.0, None, False, None, None, None, 0.0,
+                                True, True, True)
+        runtime._dispatch_command(following, State.AUTO_POST_PICK)
+        self.assertEqual(len(motor.commands), 2)
+        self.assertEqual(motor.commands[0].source, "heading")
+        self.assertEqual(motor.commands[1].source, "vision")
+
+    def test_visual_dispatch_uses_target_y_for_sloped_x_goal(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class RecordingMotor:
+            armed = True
+            def __init__(self): self.commands = []
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, _reason): pass
+            def hold_stopped(self, _reason, _token=None): pass
+
+        motor = RecordingMotor()
+        runtime = FieldControlRuntime(RuntimeConfig(
+            stream_enabled=False, auto_base_rpm=5.0, vision_kp=1.0,
+            max_vision_correction_rpm=10.0, max_rpm=10.0,
+            vision=VisionConfig(x_goal=.5, x_goal_top=0.0)),
+            PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        vision = type("Vision", (), {"target_x": 10.0, "target_y": 0.0,
+                  "overlay": type("Overlay", (), {"shape": (20, 20)})()})()
+        observation = Observation(0.0, vision, 0.0, None, False, None, None, None, 0.0,
+                                  True, True, True)
+        runtime._dispatch_command(observation, State.AUTO_ROW_FOLLOW)
+        self.assertEqual(motor.commands[-1].source, "vision")
+        self.assertGreater(motor.commands[-1].left_rpm, motor.commands[-1].right_rpm)
 
     def test_stationary_auto_hold_is_idempotent_without_masking_stop_or_motion(self):
         """AUTO_PICK must not repeatedly preempt the shared encoder worker."""
@@ -1254,15 +1314,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
         finally:
             runtime.close()
 
-    def test_web_standby_timeout_fails_closed_and_disarms(self):
+    def test_web_standby_is_indefinite_and_never_admits_a_command_on_clock_jump(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
             def start(self): pass
             def stop(self): pass
 
         class Physical:
-            def __init__(self): self.armed = True; self.stops = []
+            def __init__(self): self.armed = True; self.stops = []; self.commands = []
             def arm(self, _token): pass
+            def command(self, command, _token): self.commands.append(command)
             def stop_all(self, reason): self.armed = False; self.stops.append(reason)
 
         now = [10.0]
@@ -1270,14 +1331,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
         runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor,
                                       clock=lambda: now[0])
         runtime._lifecycle = _Lifecycle.RUNNING
-        runtime._web_standby_deadline_s = 10.0
-        self.assertTrue(runtime._expire_web_standby_if_due(now[0]))
-        self.assertFalse(motor.armed)
-        self.assertEqual(motor.stops, ["WEB_STANDBY_TIMEOUT"])
-        self.assertEqual(runtime.status().fault, "WEB_STANDBY_TIMEOUT")
-        self.assertFalse(runtime.web_standby_status()[0])
+        runtime._web_standby = True
+        now[0] += 1_000_000_000.0
+        runtime.tick()
+        self.assertTrue(motor.armed)
+        self.assertEqual(motor.stops, [])
+        self.assertEqual(motor.commands, [])
+        self.assertIsNone(runtime.status().fault)
+        self.assertEqual(runtime.web_standby_status(), (True, None))
 
-    def test_threaded_watchdog_keeps_valid_no_motion_web_standby_alive_until_its_deadline(self):
+    def test_threaded_watchdog_keeps_valid_no_motion_web_standby_alive_without_a_deadline(self):
         """Standby is not a stalled control loop or an expired drive lease."""
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()
@@ -1304,7 +1367,6 @@ class RuntimeIntegrationTests(unittest.TestCase):
             def _run(self): self._stop.wait()
 
         config = self._physical_config(odometry_timeout_s=.3)
-        config = RuntimeConfig(**{**config.__dict__, "physical_web_standby_timeout_s": .45})
         motor = Physical()
         runtime = BlockingRuntime(config, PassiveSource(), PassiveSource(), motor=motor,
                                   odometry=OdometrySource(Angles(), DriveGeometry()), lease=lease)
@@ -2149,6 +2211,43 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertIsNone(status.fault)
         self.assertIsNone(runtime.heading.reference.reference_deg)
         self.assertEqual(runtime.heading.reference.reliable_distance_m, 0.0)
+
+    def test_pick_to_post_pick_without_heading_fails_closed_before_motor_command(self):
+        class Source:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+            def snapshot(self): return self.latest.snapshot()
+
+        class Motor:
+            armed = False
+            def __init__(self): self.commands = []; self.stops = []
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, reason): self.stops.append(reason)
+
+        now = [1.0]
+        camera, imu, odometry = Source(), Source(), Source()
+        camera.latest.publish(object(), now[0])
+        imu.latest.publish(ImuReading(10.0, now[0]), now[0])
+        odometry.latest.publish(1.0, now[0])
+        motor = Motor()
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False, max_rpm=10, auto_base_rpm=5),
+                                      camera, imu, motor=motor, odometry=odometry, clock=lambda: now[0])
+        runtime._vision = type("Vision", (), {
+            "target_x": None, "bud_in_trigger_zone": True, "bud_in_pick_zone": False,
+            "marker_found": False, "overlay": type("Overlay", (), {"shape": (240, 320)})(),
+        })()
+        runtime._last_frame_timestamp = now[0]
+        runtime._last_imu_timestamp = now[0]  # Fresh sample, but no filtered heading was available.
+        runtime.machine.state = State.AUTO_PICK
+        runtime.machine._pick_started_at = -1.0
+        runtime.machine._pick_clear_started_at = -1.0
+
+        status = runtime.tick()
+
+        self.assertEqual(status.fault, "IMU_HEADING_UNAVAILABLE")
+        self.assertEqual(status.state, State.FAULT.value)
+        self.assertEqual(motor.commands, [])
 
     def test_backward_odometry_in_auto_row_follow_remains_strict_reference_failure(self):
         """Unexpected reverse progress is not silently hidden while following a row."""

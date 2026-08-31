@@ -251,7 +251,7 @@ class IndependentWatchdogTests(unittest.TestCase):
             recovery.start()
             self.assertTrue(entered.wait(.2))
             # Boundary STOP is already queued, but lifecycle ownership has
-            # not yet published runtime's standby deadline/state/token.
+            # not yet published runtime's standby state/token.
             manual = threading.Thread(
                 target=lambda: self._capture(
                     lambda: runtime.manual_command(WheelCommand(4, 4, "must wait")), manual_errors),

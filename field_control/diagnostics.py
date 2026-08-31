@@ -16,7 +16,17 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
                          (observation.odometry_sample.forward_distance_m
                           if observation.odometry_sample is not None else observation.distance_m))
     target_x = None if vision is None else vision.target_x
-    x_goal_px = runtime.config.vision.x_goal * runtime.config.processing_width
+    target_y = None if vision is None else getattr(vision, "target_y", None)
+    master_row = None if vision is None else getattr(vision, "master_row", None)
+    overlay = None if vision is None else getattr(vision, "overlay", None)
+    height, width = ((overlay.shape[0], overlay.shape[1])
+                     if getattr(overlay, "shape", None) is not None
+                     else (getattr(runtime.config, "processing_height", 1),
+                           runtime.config.processing_width))
+    goal_y = height - 1 if target_y is None else target_y
+    goal_normalized = getattr(runtime.config.vision, "goal_x_normalized", None)
+    x_goal_px = ((goal_normalized(goal_y, height, master_row or 1) if callable(goal_normalized)
+                  else runtime.config.vision.x_goal) * width)
     heading_error = None if heading is None or reference is None else (reference - heading + 180.0) % 360.0 - 180.0
     standby_active, standby_deadline_s = runtime.web_standby_status()
     return {
@@ -46,7 +56,10 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
                     "reference_reliable": False if observation is None else observation.row_heading_reliable,
                     "reference_build_distance_m": runtime.heading.reference.reliable_distance_m,
                     "heading_error_deg": heading_error},
-        "vision": {"target_x_px": target_x, "x_goal_px": x_goal_px,
+        "vision": {"target_x_px": target_x, "target_y_px": target_y, "x_goal_px": x_goal_px,
+                   "master_row": master_row,
+                   "row_1_target_x_px": None if vision is None else getattr(vision, "row_1_target_x", None),
+                   "row_2_target_x_px": None if vision is None else getattr(vision, "row_2_target_x", None),
                    "target_valid": target_x is not None,
                    "bud_in_trigger_zone": False if vision is None else vision.bud_in_trigger_zone,
                    "bud_in_pick_zone": False if vision is None else vision.bud_in_pick_zone,

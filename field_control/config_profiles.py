@@ -82,6 +82,10 @@ def operator_profile_dict(config: RuntimeConfig) -> dict[str, Any]:
     return data
 
 
+_ZONE_FIELDS = frozenset({"navigation_zone", "trigger_zone", "pick_zone", "turn_marker_zone",
+                          "navigation_zone_2", "trigger_zone_2", "pick_zone_2"})
+
+
 def _merge(base: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in profile.items():
@@ -89,7 +93,14 @@ def _merge(base: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"operatörsprofil får inte innehålla deployment-parametern {key}")
         if key not in merged:
             raise ValueError(f"okänd profilparameter: {key}")
-        if isinstance(value, dict) and isinstance(merged[key], dict):
+        # Zone encodings are discriminated unions (legacy rectangle,
+        # explicit trapezoid, or goal-relative).  They must replace as one
+        # strict object: recursively merging their incompatible key sets can
+        # fabricate a malformed hybrid before config_io has a chance to
+        # validate the profile.
+        if key in _ZONE_FIELDS:
+            merged[key] = value
+        elif isinstance(value, dict) and isinstance(merged[key], dict):
             merged[key] = _merge(merged[key], value)
         else:
             merged[key] = value

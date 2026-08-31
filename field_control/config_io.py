@@ -7,7 +7,8 @@ import math
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import HsvFilter, PhysicalCanConfig, RuntimeConfig, VisionConfig, Zone
+from .config import (FirstCrop, GoalRelativeZone, HsvFilter, PhysicalCanConfig,
+                     RuntimeConfig, TrapezoidZone, VisionConfig, Zone)
 from .odometry import DriveGeometry
 from .state_machine import SafetyConfig
 
@@ -55,13 +56,26 @@ def _tuple3(value: Any, path: str) -> tuple[int, int, int]:
     return tuple(_integer(item, f"{path}[{index}]") for index, item in enumerate(value))  # type: ignore[return-value]
 
 
-def _zone(value: Any, path: str) -> Zone:
-    data = _object(value, Zone, path)
-    missing = {field.name for field in fields(Zone)} - set(data)
+def _zone(value: Any, path: str) -> Zone | TrapezoidZone | GoalRelativeZone:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} måste vara ett JSON-objekt")
+    cls = (GoalRelativeZone if "x_distance" in value else
+           TrapezoidZone if {"x_min_top", "x_max_top", "x_min_bottom", "x_max_bottom"} & set(value) else Zone)
+    data = _object(value, cls, path)
+    missing = {field.name for field in fields(cls)} - set(data)
     if missing:
         raise ValueError(f"saknade nycklar i {path}: {', '.join(sorted(missing))}")
-    return Zone(**{field.name: _number(data[field.name], f"{path}.{field.name}")
-                   for field in fields(Zone)})
+    return cls(**{field.name: _number(data[field.name], f"{path}.{field.name}")
+                  for field in fields(cls)})
+
+
+def _first_crop(value: Any, path: str) -> FirstCrop:
+    data = _object(value, FirstCrop, path)
+    missing = {field.name for field in fields(FirstCrop)} - set(data)
+    if missing:
+        raise ValueError(f"saknade nycklar i {path}: {', '.join(sorted(missing))}")
+    return FirstCrop(**{field.name: _number(data[field.name], f"{path}.{field.name}")
+                        for field in fields(FirstCrop)})
 
 
 def _hsv(value: Any, path: str) -> HsvFilter:
@@ -83,16 +97,22 @@ def _vision(value: Any) -> VisionConfig:
         path = f"vision.{field.name}"
         if field.name in ("buds", "leaves", "marker"):
             kwargs[field.name] = getattr(defaults, field.name) if field.name not in data else _hsv(item, path)
-        elif field.name.endswith("_zone"):
+        elif field.name.endswith("_zone") or "_zone_" in field.name:
             kwargs[field.name] = getattr(defaults, field.name) if field.name not in data else _zone(item, path)
+        elif field.name == "first_crop":
+            kwargs[field.name] = getattr(defaults, field.name) if field.name not in data else _first_crop(item, path)
         elif field.name == "navigation_mode":
             kwargs[field.name] = _string(item, path)
         elif field.name == "x_filter_window_frames":
             kwargs[field.name] = _integer(item, path)
         elif field.name == "x_outlier_threshold_px":
             kwargs[field.name] = None if item is None else _number(item, path)
+        elif field.name == "x_goal_top":
+            kwargs[field.name] = None if item is None else _number(item, path)
         else:
             kwargs[field.name] = _number(item, path)
+    if isinstance(kwargs["turn_marker_zone"], GoalRelativeZone):
+        raise ValueError("vision.turn_marker_zone stöder inte målrelativ zon")
     return VisionConfig(**kwargs)
 
 

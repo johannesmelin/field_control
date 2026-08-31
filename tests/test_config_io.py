@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import patch
 
 from field_control.app import FieldControlApplication
-from field_control.config import RuntimeConfig
+from field_control.config import (FirstCrop, GoalRelativeZone, RuntimeConfig,
+                                  TrapezoidZone, VisionConfig)
 from field_control.config_io import (dump_runtime_config, load_runtime_config,
                                      runtime_config_from_dict, runtime_config_to_dict)
 
@@ -110,11 +111,40 @@ class ConfigIoTests(unittest.TestCase):
     def test_log_level_is_strict(self):
         with self.assertRaises(ValueError): RuntimeConfig(log_level="verbose").validate()
 
-    def test_physical_web_standby_timeout_allows_180_seconds_only(self):
-        config = RuntimeConfig(physical_web_standby_timeout_s=180.0)
+    def test_deprecated_web_standby_timeout_loads_but_has_no_validation_limit(self):
+        config = RuntimeConfig(physical_web_standby_timeout_s=999999.0)
         self.assertIs(config.validate(), config)
-        with self.assertRaisesRegex(ValueError, "högst 180 s"):
-            RuntimeConfig(physical_web_standby_timeout_s=180.001).validate()
+
+    def test_control_lease_timeout_allows_500ms_but_rejects_longer(self):
+        self.assertEqual(RuntimeConfig(control_lease_timeout_s=.5).validate().control_lease_timeout_s, .5)
+        with self.assertRaisesRegex(ValueError, "högst 500 ms"):
+            RuntimeConfig(control_lease_timeout_s=.500001).validate()
+
+    def test_legacy_zones_load_unchanged_and_perspective_vision_round_trips(self):
+        legacy = runtime_config_from_dict({"vision": {"navigation_zone": {
+            "x_min": .1, "x_max": .9, "y_min": .2, "y_max": .8,
+        }}})
+        self.assertEqual(legacy.vision.navigation_zone.__class__.__name__, "Zone")
+        config = RuntimeConfig(vision=VisionConfig(
+            navigation_zone=TrapezoidZone(.1, .7, .2, .2, .9, .8),
+            first_crop=FirstCrop(.1, .9, .15, .95), x_goal=.7, x_goal_top=.3))
+        document = runtime_config_to_dict(config)
+        loaded = runtime_config_from_dict(document)
+        self.assertEqual(loaded, config)
+        self.assertEqual(document["vision"]["navigation_zone"]["x_min_top"], .1)
+
+    def test_goal_relative_zones_round_trip_while_legacy_zone_profiles_remain_literal(self):
+        modern = RuntimeConfig()
+        document = runtime_config_to_dict(modern)
+        self.assertEqual(document["vision"]["navigation_zone"],
+                         {"x_distance": .3, "y_min": .3, "y_max": 1.0})
+        self.assertEqual(runtime_config_from_dict(document), modern)
+        legacy_document = runtime_config_to_dict(RuntimeConfig(
+            vision=VisionConfig(navigation_zone=GoalRelativeZone(.3, .3, 1.0))))
+        legacy_document["vision"]["navigation_zone"] = {
+            "x_min": .2, "x_max": .8, "y_min": .3, "y_max": 1.0,
+        }
+        self.assertEqual(runtime_config_from_dict(legacy_document).vision.navigation_zone.__class__.__name__, "Zone")
 
 
 if __name__ == "__main__":

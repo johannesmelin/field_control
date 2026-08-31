@@ -500,6 +500,39 @@ Konfigurationstyperna finns i `field_control/config.py`. Viktiga värden är:
 - visionens HSV-filter och normaliserade zoner;
 - navigationens P-regulatorer och hastighetsgränser.
 
+### Perspektiv, crop och zoner
+
+Visionen kan följa två rader samtidigt. Rad 1 använder de befintliga
+`x_goal`-, `navigation_zone`-, `trigger_zone`- och `pick_zone`-fälten;
+rad 2 använder respektive suffix `_2`. Rad 1 är alltid master när båda har
+ett giltigt target, annars tar rad 2 över direkt. Trigger och pick är OR över
+de två radzonerna, medan `turn_marker_zone` är gemensam. Varje rad har egen
+targethistorik och sitt eget perspektivprojicerade x-goal.
+
+`vision.first_crop` är en normaliserad första beskärning (`x_min`, `x_max`,
+`y_min`, `y_max`). Den utförs före HSV-filtrering, zonmaskning, detektion och
+visning; arbetsbilden skalas inte om. Standardvärdet är hela bilden.
+
+De moderna navigation-, trigger- och pick-zonerna är `GoalRelativeZone`.
+De har en enda `x_distance`: halva zonbredden vid arbetsbildens nedre kant,
+relativt `x_goal`. Zonen följer därmed mållinjen och blir smalare mot den bredare,
+fjärran bilddelen med bibehållen fysisk halvbredd. Dashboarden visar endast
+detta tydliga avståndsfält för dessa zoner. Äldre rektanglar (`Zone`) och
+explicita `TrapezoidZone`-profiler stöds fortsatt oförändrat. Värdena
+`vision.ground_width_bottom_m` och `vision.ground_width_top_m` avser
+markbredden vid den fulla, obeskurna bildens nedre respektive övre kant;
+cropens verkliga placering räknas med i projektionen.
+
+`vision.x_goal` är målet vid arbetsbildens nedre kant. Vid olika
+markbredder beräknas dess övre ändpunkt från samma fysiska sidoförskjutning.
+Ett explicit `vision.x_goal_top` kan användas som kalibrerad åsidosättning.
+Regulatorn använder mållinjen vid det detekterade målets y-position.
+
+De uppmätta startvärdena för den aktuella fullbilden är `0.36 m` vid nedre
+kanten och `0.91 m` vid övre kanten. De ska anges i den sparade profilen innan
+perspektivstyrningen aktiveras och verifieras sedan med kamerabild och säker
+fysisk provning.
+
 `field_control.config_io` läser och skriver strikt JSON med enbart
 standardbiblioteket. Okända nycklar, `NaN`/`Infinity`, booleska värden där ett
 tal krävs och ogiltiga nested-värden avvisas innan den vanliga
@@ -583,9 +616,9 @@ marktest- eller upphissad-hjul-gates), bindning till en numerisk loopback-IP
 och två separata CLI-bekräftelser. Den startar alltid disarmerad; webbläsaren
 kan aldrig armera motorerna. Om lokal armering avsiktligt önskas görs den först
 efter att runtime och watchdog är igång och fortfarande i `MANUAL`. Den byts
-sedan omedelbart till en konfigurerbar (högst 180 s), helt
-stillastående webb-standby utan aktiv drive-lease. Första giltiga webbaserade
-MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 300 ms-lease. AUTO-
+sedan omedelbart till en obegränsad, helt stillastående webb-standby utan
+aktiv drive-lease. Första giltiga webbaserade
+MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 500 ms-lease. AUTO-
 valet ensamt kan inte förnya eller ta över den. `ROW_LOST`, explicit STOP,
 lease-/watchdog-expiry och återställbara runtime-fel köar nollutgång och går
 till armerad, stillastående MANUAL-standby; en ny manuell riktning claimar

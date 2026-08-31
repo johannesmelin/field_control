@@ -8,7 +8,7 @@ import stat
 import tempfile
 import unittest
 
-from field_control.config import PhysicalCanConfig, RuntimeConfig
+from field_control.config import GoalRelativeZone, PhysicalCanConfig, RuntimeConfig, Zone
 from field_control.config_profiles import (list_profiles, load_selected_or_latest,
                                            load_profile, operator_profile_dict, save_profile,
                                            select_profile)
@@ -67,3 +67,31 @@ class ConfigProfileTests(unittest.TestCase):
             deployment = RuntimeConfig(control_lease_timeout_s=.3, watchdog_period_s=.02,
                                        max_control_stall_s=.12, physical_web_standby_timeout_s=30.0)
             with self.assertRaises(ValueError): load_profile(name, deployment, directory)
+
+    def test_legacy_zone_profile_replaces_modern_default_shape_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); name = "konfig_20260831_153611.json"
+            profile = operator_profile_dict(RuntimeConfig())
+            profile["vision"]["x_goal"] = .25
+            for key, y_min in (("navigation_zone", .3), ("trigger_zone", .8),
+                               ("pick_zone", .5), ("turn_marker_zone", .6)):
+                profile["vision"][key] = {"x_min": .1, "x_max": .4,
+                                          "y_min": y_min, "y_max": 1.0}
+            (directory / name).write_text(json.dumps(profile))
+            loaded = load_profile(name, RuntimeConfig(), directory)
+            self.assertEqual(loaded.vision.x_goal, .25)
+            self.assertEqual(loaded.vision.navigation_zone, Zone(.1, .4, .3, 1.0))
+            self.assertEqual(loaded.vision.pick_zone, Zone(.1, .4, .5, 1.0))
+
+    def test_modern_goal_relative_profile_loads_and_bad_zone_shape_is_not_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); name = "konfig_20260101_010101.json"
+            profile = operator_profile_dict(RuntimeConfig())
+            (directory / name).write_text(json.dumps(profile))
+            self.assertEqual(load_profile(name, RuntimeConfig(), directory).vision.navigation_zone,
+                             GoalRelativeZone(.3, .3, 1.0))
+            profile["vision"]["navigation_zone"] = {"x_min": .1, "x_max": .4,
+                                                      "y_min": .3, "y_max": 1.0,
+                                                      "unexpected": 1}
+            (directory / name).write_text(json.dumps(profile))
+            with self.assertRaises(ValueError): load_profile(name, RuntimeConfig(), directory)
