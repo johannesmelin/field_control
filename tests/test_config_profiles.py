@@ -37,6 +37,37 @@ class ConfigProfileTests(unittest.TestCase):
             config, name = load_selected_or_latest(deployment, directory)
             self.assertEqual((name, config.manual_rpm), (first, 2))
 
+    def test_selected_legacy_320_by_240_profile_migrates_to_full_fov_geometry(self):
+        """Selected old profiles remain startable while adopting full CAM_B FOV."""
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            deployment = RuntimeConfig()
+            name = "konfig_20260901_151942.json"
+            profile = operator_profile_dict(deployment)
+            profile.update({
+                "processing_width": 320, "processing_height": 240,
+                "stream_width": 320, "stream_height": 240,
+            })
+            (directory / name).write_text(json.dumps(profile))
+            select_profile(name, directory)
+
+            loaded, selected = load_selected_or_latest(deployment, directory)
+
+        self.assertEqual(selected, name)
+        self.assertEqual((loaded.processing_width, loaded.processing_height), (320, 200))
+        self.assertEqual((loaded.stream_width, loaded.stream_height), (320, 200))
+
+    def test_profile_does_not_silently_normalize_arbitrary_non_16_by_10_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            name = "konfig_20260901_151943.json"
+            profile = operator_profile_dict(RuntimeConfig())
+            profile.update({"processing_width": 640, "processing_height": 480})
+            (directory / name).write_text(json.dumps(profile))
+
+            with self.assertRaisesRegex(ValueError, "16:10"):
+                load_profile(name, RuntimeConfig(), directory)
+
     def test_symlink_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp); target = directory / "outside.json"; target.write_text("{}")

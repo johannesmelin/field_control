@@ -394,14 +394,16 @@ class RuntimeConfig:
     physical_can: PhysicalCanConfig = PhysicalCanConfig()
     odometry_geometry: DriveGeometry = DriveGeometry()
     row_spacing_m: float = 1.2
+    # CAM_B's 1280x800 sensor is 16:10. Keeping the same ratio prevents the
+    # acquisition backend from discarding either side of the camera image.
     processing_width: int = 320
-    processing_height: int = 240
+    processing_height: int = 200
     navigation_frame_rate_hz: float = 10.0
     imu_sample_hz: int = 100
     stream_enabled: bool = True
     stream_fps: float = 5.0
     stream_width: int = 320
-    stream_height: int = 240
+    stream_height: int = 200
     jpeg_quality: int = 85
     # All speed values below are motor-side RPM before DriveGeometry's ratio.
     max_rpm: float = 0.0
@@ -479,6 +481,9 @@ class RuntimeConfig:
         dimensions = (self.processing_width, self.processing_height, self.stream_width, self.stream_height)
         if any(value < 1 for value in dimensions) or self.jpeg_quality not in range(1, 101):
             raise ValueError("bilddimensioner och JPEG-kvalitet är ogiltiga")
+        if (self.processing_width * 5 != self.processing_height * 8
+                or self.stream_width * 5 != self.stream_height * 8):
+            raise ValueError("CAM_B fullbild kräver 16:10 för processering och stream")
         if self.navigation_frame_rate_hz <= 0 or self.stream_fps <= 0:
             raise ValueError("bildfrekvens måste vara positiv")
         if isinstance(self.imu_sample_hz, bool) or not isinstance(self.imu_sample_hz, int) or self.imu_sample_hz <= 0:

@@ -17,6 +17,29 @@ from .odometry import DriveGeometry, OdometrySample, from_motor_angles
 ValueT = TypeVar("ValueT")
 
 
+# CAM_B (OV9782) exposes a 1280 x 800, 16:10 image. Every acquired frame
+# must retain that field of view: downstream perspective calibration assumes
+# that a pixel's horizontal coordinate is measured in this complete image.
+CAM_B_SENSOR_SIZE = (1280, 800)
+CAM_B_ASPECT_NUMERATOR = 8
+CAM_B_ASPECT_DENOMINATOR = 5
+
+
+def _full_fov_camera_output(camera, dai, width: int, height: int, fps: float):
+    """Request a scale-only, full-CAM_B-FOV BGR output queue.
+
+    ``STRETCH`` has no padding pixels. With the required 16:10 output it is
+    mathematically a uniform resize of the complete 1280 x 800 sensor image,
+    not a crop and not a geometric stretch.
+    """
+    if width * CAM_B_ASPECT_DENOMINATOR != height * CAM_B_ASPECT_NUMERATOR:
+        raise ValueError("CAM_B fullbild kräver 16:10-utmatning")
+    return camera.requestOutput(
+        size=(width, height), type=dai.ImgFrame.Type.BGR888p,
+        resizeMode=dai.ImgResizeMode.STRETCH, fps=fps,
+    ).createOutputQueue(maxSize=2, blocking=False)
+
+
 class EncoderReadPreempted(RuntimeError):
     """A physical encoder read lost to an intentional STOP/restart settle.
 
@@ -442,10 +465,7 @@ class DepthAICameraBackend:
         import depthai as dai
         self._pipeline = dai.Pipeline()
         camera = self._pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-        self._queue = camera.requestOutput(
-            size=(self.width, self.height), type=dai.ImgFrame.Type.BGR888p,
-            resizeMode=dai.ImgResizeMode.CROP, fps=self.fps,
-        ).createOutputQueue(maxSize=2, blocking=False)
+        self._queue = _full_fov_camera_output(camera, dai, self.width, self.height, self.fps)
         self._pipeline.start()
         while True:
             yield self._queue.get().getCvFrame()
@@ -555,10 +575,8 @@ class DepthAICombinedBackend:
             self.heading_converter = lambda quaternion: heading_from_imu_quaternion(quaternion, rotation)
             imu.enableIMUSensor(dai.IMUSensor.ROTATION_VECTOR, self.imu_rate_hz)
             imu.setBatchReportThreshold(1); imu.setMaxBatchReports(10)
-            camera_queue = camera.requestOutput(
-                size=(self.width, self.height), type=dai.ImgFrame.Type.BGR888p,
-                resizeMode=dai.ImgResizeMode.CROP, fps=self.camera_fps,
-            ).createOutputQueue(maxSize=2, blocking=False)
+            camera_queue = _full_fov_camera_output(
+                camera, dai, self.width, self.height, self.camera_fps)
             imu_queue = imu.out.createOutputQueue(maxSize=10, blocking=False)
             pipeline.start()
             self._pipeline, self._camera_queue, self._imu_queue = pipeline, camera_queue, imu_queue

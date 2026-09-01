@@ -2370,10 +2370,17 @@ class RuntimeIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RuntimeConfig(camera_timeout_s=0).validate()
 
-    def test_runtime_defaults_to_320_by_240_for_processing_and_streaming(self):
+    def test_runtime_defaults_to_full_cam_b_16_by_10_for_processing_and_streaming(self):
         config = RuntimeConfig()
-        self.assertEqual((config.processing_width, config.processing_height), (320, 240))
-        self.assertEqual((config.stream_width, config.stream_height), (320, 240))
+        self.assertEqual((config.processing_width, config.processing_height), (320, 200))
+        self.assertEqual((config.stream_width, config.stream_height), (320, 200))
+        self.assertIs(config.validate(), config)
+
+    def test_runtime_rejects_non_16_by_10_camera_geometry(self):
+        with self.assertRaisesRegex(ValueError, "16:10"):
+            RuntimeConfig(processing_width=320, processing_height=240).validate()
+        with self.assertRaisesRegex(ValueError, "16:10"):
+            RuntimeConfig(stream_width=320, stream_height=240).validate()
 
     def test_tilt_compensated_quaternion_heading_is_circular(self):
         self.assertAlmostEqual(heading_from_imu_quaternion((0, 0.70710678, 0, 0.70710678)), 0.0, places=4)

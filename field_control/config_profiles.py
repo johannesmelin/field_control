@@ -107,6 +107,20 @@ def _merge(base: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _normalize_legacy_cam_b_geometry(config: dict[str, Any]) -> dict[str, Any]:
+    """Migrate only the known pre-full-FOV CAM_B 320x240 representation."""
+    normalized = dict(config)
+    # Before full-width CAM_B support, operator profiles used exactly 320x240
+    # and the acquisition path centre-cropped the 16:10 sensor. Other aspect
+    # ratios remain invalid so no arbitrary operator geometry is changed.
+    for width_key, height_key in (("processing_width", "processing_height"),
+                                  ("stream_width", "stream_height")):
+        if (type(normalized[width_key]) is int and type(normalized[height_key]) is int
+                and normalized[width_key] == 320 and normalized[height_key] == 240):
+            normalized[height_key] = 200
+    return normalized
+
+
 def list_profiles(directory: Path | None = None) -> list[str]:
     directory = _directory(directory or default_profiles_dir())
     names: list[str] = []
@@ -130,7 +144,8 @@ def _load_json(path: Path) -> dict[str, Any]:
 def load_profile(name: str, deployment: RuntimeConfig, directory: Path | None = None) -> RuntimeConfig:
     directory = _directory(directory or default_profiles_dir())
     profile = _load_json(_safe_child(directory, name))
-    return runtime_config_from_dict(_merge(asdict(deployment.validate()), profile))
+    merged = _merge(asdict(deployment.validate()), profile)
+    return runtime_config_from_dict(_normalize_legacy_cam_b_geometry(merged))
 
 
 def save_profile(config: RuntimeConfig, directory: Path | None = None, *, now: datetime | None = None) -> str:

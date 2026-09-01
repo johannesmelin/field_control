@@ -422,8 +422,9 @@ finally:
 	application.close()
 ```
 
-Med standardkonfigurationen används `320x240` för både processering och
-livestream. Utan encoderbackend rapporterar runtime saknad odometri och
+Med standardkonfigurationen används `320x200` (16:10) för både processering
+och livestream. Det är samma format som CAM_B:s fulla `1280x800`-bild och
+bevarar därmed hela kamerabredden utan sidocrop eller letterbox-pixlar. Utan encoderbackend rapporterar runtime saknad odometri och
 förblir fail-closed vid aktiv AUTO-körning.
 
 ## Webgränssnitt
@@ -491,14 +492,19 @@ Den fysiska OAK-D/BNO086-kommunikationen har verifierats med:
 
 Konfigurationstyperna finns i `field_control/config.py`. Viktiga värden är:
 
-- `processing_width` / `processing_height`: standard `320x240`;
-- `stream_width` / `stream_height`: standard `320x240`;
+- `processing_width` / `processing_height`: standard `320x200` (16:10);
+- `stream_width` / `stream_height`: standard `320x200` (16:10);
 - `camera_timeout_s`, `imu_timeout_s`, `odometry_timeout_s`;
 - `heading_filter_alpha`;
 - `row_heading_window_m` och `heading_reference_min_distance_m`;
 - `row_spacing_m` och `odometry_geometry`;
 - visionens HSV-filter och normaliserade zoner;
 - navigationens P-regulatorer och hastighetsgränser.
+
+Äldre operatörsprofiler med den tidigare exakta CAM_B-storleken `320x240`
+migreras vid inläsning till `320x200`, så att vald/senaste profil fortsatt kan
+startas med hela bildbredden. Andra bildformat avvisas i stället; de kan inte
+ändras tyst utan ny perspektivkalibrering.
 
 I webbfliken **Odometri och geometri** anges `wheel_circumference_m` som ett
 gemensamt positivt värde. Vid sparande/omstart tilldelas värdet atomärt till
