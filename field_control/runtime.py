@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
+import secrets
 import threading
 import time
 from typing import TYPE_CHECKING, Callable
@@ -230,6 +231,14 @@ class FieldControlRuntime:
         # local arm and retains an indefinite, no-motion handoff. It is never
         # a command admission token; MANUAL/Start Auto claim a fresh lease.
         self._web_standby = False
+        # Opaque HTTP MANUAL authority, distinct from the motor lease.  It
+        # prevents delayed browser requests from reclaiming standby after
+        # STOP or lease expiry.
+        self._manual_web_session: str | None = None
+        # Publicly observable but unguessable freshness value. A browser must
+        # echo the epoch it observed in standby before the server creates a
+        # manual session, fencing a queued pre-STOP session request.
+        self._manual_web_epoch = secrets.token_urlsafe(32)
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -1015,6 +1024,7 @@ class FieldControlRuntime:
         Callers hold ``_lifecycle_lock``.  The reservation deliberately comes
         before any standby lease claim, source fence, or STOP admission.
         """
+        self._invalidate_manual_web_session()
         with self._lock:
             if self._application_restart_pending:
                 raise ValueError("programomstart väntar")
@@ -1050,7 +1060,11 @@ class FieldControlRuntime:
         if token is None:
             raise ValueError("AUTO-start saknar fysisk control-lease")
         try:
-            self.lease.refresh(token)
+            refresh = getattr(self.motor, "refresh_lease_or_recover_expired", None)
+            if callable(refresh):
+                refresh(token, CONTROL_LEASE_EXPIRED)
+            else:
+                self.lease.refresh(token)
         except ValueError:
             with self._lock:
                 cancelled = start_generation != self._auto_start_generation
@@ -1657,12 +1671,69 @@ class FieldControlRuntime:
             self._lease_token = token
             self._clear_web_standby()
 
+    def _invalidate_manual_web_session(self) -> None:
+        """Revoke HTTP MANUAL authority without exposing a reusable token."""
+        with self._lock:
+            self._manual_web_session = None
+            self._manual_web_epoch = secrets.token_urlsafe(32)
+
+    def manual_web_epoch(self) -> str:
+        """Return the current opaque browser-session freshness epoch."""
+        with self._lock:
+            return self._manual_web_epoch
+
+    def begin_manual_web_session(self, epoch: str) -> str:
+        """Create no-motion authority for one fresh browser pointer-down."""
+        with self._lifecycle_lock:
+            with self._lock:
+                blocked = (self._application_restart_pending
+                           or self._configuration_restart_pending
+                           or self._auto_start_pending
+                           or self._manual_transition_pending)
+                standby = self._web_standby
+            if blocked or self._lifecycle is not _Lifecycle.RUNNING:
+                raise ValueError("manuell webbsession är inte tillgänglig")
+            if self._arming_in_progress or not self._is_physical_output() or not getattr(self.motor, "armed", False):
+                raise ValueError("motorutgången är inte redo för manuell webbsession")
+            with self._state_lock:
+                if self.machine.state is not State.MANUAL or self._auto_selected:
+                    raise ValueError("manuell webbsession kräver MANUAL")
+            if not standby:
+                raise ValueError("manuell webbsession kräver rörelselös webbstandby")
+            if not isinstance(epoch, str) or not epoch:
+                raise ValueError("manuell webbsession saknar freshness-epoch")
+            session = secrets.token_urlsafe(32)
+            with self._lock:
+                # A new pointer-down may replace an unclaimed stale browser
+                # session, but it never claims the motor boundary itself.
+                if not self._web_standby:
+                    raise ValueError("manuell webbsession är inte längre tillgänglig")
+                if not secrets.compare_digest(self._manual_web_epoch, epoch):
+                    raise ValueError("manuell webbsession har en inaktuell freshness-epoch")
+                self._manual_web_session = session
+            return session
+
+    def manual_web_command(self, session: str, command: WheelCommand) -> None:
+        """Admit a browser MANUAL command only for the current session."""
+        if not isinstance(session, str) or not session:
+            raise ValueError("manuell webbsession saknas")
+        with self._lifecycle_lock:
+            with self._lock:
+                active = self._manual_web_session
+            if active is None or not secrets.compare_digest(active, session):
+                raise ValueError("manuell webbsession är utgången eller ogiltig")
+            self._manual_command_serialized(command)
+
     def _refresh_active_lease(self, state: State) -> None:
         if not self._is_physical_output() or state not in FieldStateMachine._ACTIVE:
             return
         if not getattr(self.motor, "armed", False) or self._lease_token is None:
             raise MotorOutputFault("fysisk motorutgång måste vara explicit armerad före AUTO")
-        self.lease.refresh(self._lease_token)
+        refresh = getattr(self.motor, "refresh_lease_or_recover_expired", None)
+        if callable(refresh):
+            refresh(self._lease_token, CONTROL_LEASE_EXPIRED)
+        else:
+            self.lease.refresh(self._lease_token)
 
     def _is_physical_output(self) -> bool:
         return callable(getattr(self.motor, "arm", None))
@@ -1724,6 +1795,7 @@ class FieldControlRuntime:
     def _stop_motor(self, reason: str) -> None:
         # Explicit STOP, watchdog/fault stop, mode selection and shutdown
         # must always remain immediate and must invalidate a prior AUTO hold.
+        self._invalidate_manual_web_session()
         self._clear_stopped_hold()
         self._clear_web_standby()
         self._clear_stationary_hold_odometry_recovery()
@@ -1762,6 +1834,7 @@ class FieldControlRuntime:
         # cannot claim the just-published standby before runtime owns its
         # deadline/state/token view.
         with self._lifecycle_lock:
+            self._invalidate_manual_web_session()
             if not self._is_physical_output():
                 return False
             recover = getattr(self.motor, "recoverable_stop_to_web_standby", None)
@@ -1877,6 +1950,7 @@ class FieldControlRuntime:
         # consume the standby that the MANUAL handoff is about to publish.
         physical_transition = False
         with self._lifecycle_lock:
+            self._invalidate_manual_web_session()
             self._cancel_pending_auto_start()
             self._clear_turn_controller()
             physical_transition = (self._is_physical_output()
@@ -1950,6 +2024,7 @@ class FieldControlRuntime:
             self._select_auto_serialized()
 
     def _select_auto_serialized(self) -> None:
+        self._invalidate_manual_web_session()
         with self._lock:
             if self._application_restart_pending:
                 raise ValueError("programomstart väntar")
@@ -2173,27 +2248,31 @@ class FieldControlRuntime:
 
     def manual_command(self, command: WheelCommand) -> None:
         with self._lifecycle_lock:
-            with self._lock:
-                if self._application_restart_pending:
-                    raise ValueError("programomstart väntar")
-                if self._configuration_restart_pending:
-                    raise ValueError("konfigurationsomstart väntar")
-                if self._auto_start_pending:
-                    raise ValueError("AUTO-start väntar på encoderavläsning")
-                if self._manual_transition_pending:
-                    raise ValueError("MANUAL väntar på att encoderläsaren pausas")
-            if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
-                raise ValueError("runtime stängs")
-            if self._arming_in_progress:
-                raise ValueError("manuell styrning väntar på att fysisk armering ska slutföras")
-            with self._state_lock:
-                if self._auto_selected:
-                    raise ValueError("AUTO har valts; välj MANUAL före manuell körning")
-            hook = self._before_manual_standby_claim
-            if hook is not None:
-                hook()
-            self._claim_web_standby_if_needed()
-            self._manual_command_admitted(command)
+            self._manual_command_serialized(command)
+
+    def _manual_command_serialized(self, command: WheelCommand) -> None:
+        """Manual admission; callers hold ``_lifecycle_lock``."""
+        with self._lock:
+            if self._application_restart_pending:
+                raise ValueError("programomstart väntar")
+            if self._configuration_restart_pending:
+                raise ValueError("konfigurationsomstart väntar")
+            if self._auto_start_pending:
+                raise ValueError("AUTO-start väntar på encoderavläsning")
+            if self._manual_transition_pending:
+                raise ValueError("MANUAL väntar på att encoderläsaren pausas")
+        if self._is_physical_output() and self._lifecycle is not _Lifecycle.RUNNING:
+            raise ValueError("runtime stängs")
+        if self._arming_in_progress:
+            raise ValueError("manuell styrning väntar på att fysisk armering ska slutföras")
+        with self._state_lock:
+            if self._auto_selected:
+                raise ValueError("AUTO har valts; välj MANUAL före manuell körning")
+        hook = self._before_manual_standby_claim
+        if hook is not None:
+            hook()
+        self._claim_web_standby_if_needed()
+        self._manual_command_admitted(command)
 
     def _manual_command_admitted(self, command: WheelCommand) -> None:
         with self._state_lock: manual = self.machine.state is State.MANUAL
@@ -2212,7 +2291,11 @@ class FieldControlRuntime:
             self._stop_motor("manuell control-lease saknas")
             raise ValueError("manuell control-lease saknas")
         try:
-            self.lease.refresh(self._lease_token)
+            refresh = getattr(self.motor, "refresh_lease_or_recover_expired", None)
+            if callable(refresh):
+                refresh(self._lease_token, CONTROL_LEASE_EXPIRED)
+            else:
+                self.lease.refresh(self._lease_token)
             self.motor.command(command, self._lease_token)
         except (RuntimeError, ValueError) as exc:
             self._fail_closed(f"MOTOR_OUTPUT_ERROR: {type(exc).__name__}: {exc}")

@@ -500,13 +500,23 @@ Konfigurationstyperna finns i `field_control/config.py`. Viktiga värden är:
 - visionens HSV-filter och normaliserade zoner;
 - navigationens P-regulatorer och hastighetsgränser.
 
+I webbfliken **Odometri och geometri** anges `wheel_circumference_m` som ett
+gemensamt positivt värde. Vid sparande/omstart tilldelas värdet atomärt till
+de kanoniska modellfälten `left_wheel_circumference_m` och
+`right_wheel_circumference_m`. Äldre JSON-profiler med skilda hjulomkretsar
+är fortsatt läsbara; webbgränssnittet visar då en varning och kräver att
+operatören uttryckligen anger ett gemensamt värde innan profilen skrivs om.
+
 ### Perspektiv, crop och zoner
 
 Visionen kan följa två rader samtidigt. Rad 1 använder de befintliga
 `x_goal`-, `navigation_zone`-, `trigger_zone`- och `pick_zone`-fälten;
 rad 2 använder respektive suffix `_2`. Rad 1 är alltid master när båda har
 ett giltigt target, annars tar rad 2 över direkt. Trigger och pick är OR över
-de två radzonerna, medan `turn_marker_zone` är gemensam. Varje rad har egen
+de två radzonerna, medan `turn_marker_zone` är gemensam. Endast knoppar (aldrig
+blast) i en triggerzon kan starta `AUTO_PICK`. Efter pick behålls samma
+masterprioritet: rad 1, sedan rad 2, och sist IMU-only-sökning. Den gemensamma
+`post_pick_lockout_distance_m` spärrar återtrigger från båda zonerna. Varje rad har egen
 targethistorik och sitt eget perspektivprojicerade x-goal.
 
 `vision.first_crop` är en normaliserad första beskärning (`x_min`, `x_max`,
@@ -618,7 +628,7 @@ kan aldrig armera motorerna. Om lokal armering avsiktligt önskas görs den för
 efter att runtime och watchdog är igång och fortfarande i `MANUAL`. Den byts
 sedan omedelbart till en obegränsad, helt stillastående webb-standby utan
 aktiv drive-lease. Första giltiga webbaserade
-MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 500 ms-lease. AUTO-
+MANUAL-kommando eller Start Auto tar atomärt en ny vanlig 1 s-lease. AUTO-
 valet ensamt kan inte förnya eller ta över den. `ROW_LOST`, explicit STOP,
 lease-/watchdog-expiry och återställbara runtime-fel köar nollutgång och går
 till armerad, stillastående MANUAL-standby; en ny manuell riktning claimar
@@ -642,11 +652,16 @@ motorprover.
 Den lokala testprofilen `field_control_web_test.json` använder `manual_rpm`
 `30` och `max_rpm` `40` (motor-RPM före 8:1-utväxlingen). En hållen
 riktningsknapp skickar den konfigurerade hastigheten. När knappen släpps
-skickar dashboarden därefter ett serverfixerat `0 RPM`-kommando var 100 ms och
-behåller den korta control-leasen, så ett nytt riktningskommando kan provas
-utan omstart. Den röda STOP-knappen, fokus-/sidförlust, nätfel eller uteblivna
-uppdateringar köar STOP och lämnar sedan armerad webbstandby redo för ett nytt
-manuellt kommando. I den
+avslutar dashboarden håll-timern och sessionen, och serialiserar ett enda
+explicit STOP efter ett eventuellt redan skickat riktningskommando. Därmed kan
+ingen sen riktningsbegäran anlända efter STOP. Varje nytt knapptryck får en
+ny slumpmässig webbsession med en serverutfärdad freshness-epoch; äldre eller
+fördröjda session- och riktningsbegäranden avvisas före de kan ta webbstandby
+i anspråk. Vid förlorad anslutning medan
+knappen hålls inne stoppar den oberoende 1 s-control-leasen fortfarande
+utgången. Den röda STOP-knappen, fokus-/sidförlust, nätfel eller uteblivna
+uppdateringar lämnar därefter armerad webbstandby redo för ett nytt manuellt
+kommando. I den
 fysiska webbstandbyn är MANUAL redan valt; tryck inte MANUAL-knappen, utan
 håll direkt inne en riktningsknapp.
 

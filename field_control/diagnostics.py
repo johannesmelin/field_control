@@ -70,7 +70,11 @@ def status_payload(runtime: FieldControlRuntime) -> dict[str, Any]:
         "motor_fault_reason": getattr(runtime.motor, "fault_reason", None),
         "can": {"ok": getattr(runtime.motor, "fault_reason", None) is None},
         "control_lease": {"active": runtime.lease.valid(None), "watchdog_timeout_s": runtime.config.control_lease_timeout_s},
-        "physical_web_standby": {"active": standby_active, "deadline_monotonic_s": standby_deadline_s},
+        "physical_web_standby": {
+            "active": standby_active,
+            "deadline_monotonic_s": standby_deadline_s,
+            "manual_web_epoch": getattr(runtime, "manual_web_epoch", lambda: None)(),
+        },
         # Configuration values for the manual-web input.  They are
         # informational only: browser input is still validated at the HTTP
         # boundary and bounded by the verified motor boundary.

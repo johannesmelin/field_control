@@ -57,6 +57,44 @@ def _manual_rpm_from_query(query: str, *, default_rpm: float, max_rpm: float,
     return float(motor_rpm)
 
 
+def _manual_session_and_rpm_from_query(query: str, *, default_rpm: float,
+                                       max_rpm: float, motor_turns_per_wheel_turn: float) -> tuple[str, float]:
+    """Parse one opaque browser session plus the optional wheel RPM."""
+    try:
+        parameters = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise ValueError("ogiltig manuell parameter") from exc
+    sessions = [value for key, value in parameters if key == "session"]
+    others = [(key, value) for key, value in parameters if key != "session"]
+    if len(sessions) != 1 or not sessions[0] or any(key != "rpm" for key, _value in others):
+        raise ValueError("manuellt kommando kräver exakt en webbsession")
+    rpm_query = "&".join(f"{key}={value}" for key, value in others)
+    return sessions[0], _manual_rpm_from_query(
+        rpm_query, default_rpm=default_rpm, max_rpm=max_rpm,
+        motor_turns_per_wheel_turn=motor_turns_per_wheel_turn,
+    )
+
+
+def _manual_session_from_query(query: str) -> str:
+    try:
+        parameters = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise ValueError("ogiltig manuell parameter") from exc
+    if len(parameters) != 1 or parameters[0][0] != "session" or not parameters[0][1]:
+        raise ValueError("manuellt hold kräver exakt en webbsession")
+    return parameters[0][1]
+
+
+def _manual_epoch_from_query(query: str) -> str:
+    try:
+        parameters = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise ValueError("ogiltig manuell parameter") from exc
+    if len(parameters) != 1 or parameters[0][0] != "epoch" or not parameters[0][1]:
+        raise ValueError("manuell webbsession kräver exakt en freshness-epoch")
+    return parameters[0][1]
+
+
 class DiagnosticsServer:
     def __init__(self, runtime: FieldControlRuntime, host: str = "127.0.0.1", port: int = 8080,
                  *, profiles_dir: Path | None = None) -> None:
@@ -207,30 +245,40 @@ class DiagnosticsServer:
                     "/api/manual/both/forward": (1.0, 1.0, "both-forward"),
                     "/api/manual/both/reverse": (-1.0, -1.0, "both-reverse"),
                 }
-                if path == "/api/manual/hold":
-                    if request.query:
-                        self._conflict("manuellt hold accepterar inte RPM-parameter"); return
+                if path == "/api/manual/session":
                     try:
-                        # This route accepts no client speed or direction. It
-                        # keeps the already-claimed MANUAL lease alive with a
-                        # verified zero A2 command after pointer release.
-                        runtime.manual_command(WheelCommand(0.0, 0.0, "web-manual-hold"))
+                        epoch = _manual_epoch_from_query(request.query)
+                        begin = getattr(runtime, "begin_manual_web_session", None)
+                        if not callable(begin):
+                            raise RuntimeError("runtime saknar manuell webbsession")
+                        self._json({"session": begin(epoch)})
+                    except (ValueError, RuntimeError) as exc:
+                        self._conflict(str(exc)); return
+                    return
+                if path == "/api/manual/hold":
+                    try:
+                        session = _manual_session_from_query(request.query)
+                        command = getattr(runtime, "manual_web_command", None)
+                        if not callable(command):
+                            raise RuntimeError("runtime saknar manuell webbsession")
+                        command(session, WheelCommand(0.0, 0.0, "web-manual-hold"))
                     except (ValueError, RuntimeError) as exc:
                         self._conflict(str(exc)); return
                     self._status(); return
                 if path in manual_directions:
                     left, right, direction = manual_directions[path]
                     try:
-                        rpm = _manual_rpm_from_query(
+                        session, rpm = _manual_session_and_rpm_from_query(
                             request.query,
                             default_rpm=runtime.config.manual_rpm,
                             max_rpm=runtime.config.max_rpm,
                             motor_turns_per_wheel_turn=getattr(getattr(runtime.config, "odometry_geometry", None),
                                                                "motor_turns_per_wheel_turn", 1.0),
                         )
-                        # Runtime enforces MANUAL, lifecycle, armed output and
-                        # the shared lease independently of HTTP input.
-                        runtime.manual_command(WheelCommand(left * rpm, right * rpm, f"web-manual-{direction}"))
+                        command = getattr(runtime, "manual_web_command", None)
+                        if not callable(command):
+                            raise RuntimeError("runtime saknar manuell webbsession")
+                        command(session, WheelCommand(left * rpm, right * rpm, f"web-manual-{direction}"))
                     except (ValueError, RuntimeError) as exc:
                         self._conflict(str(exc)); return
                     self._status(); return
@@ -377,6 +425,7 @@ rpmInput.insertAdjacentHTML('afterend','<label class="label" for="auto-rpm">Auto
 const stagedSpeedRow=document.createElement('div'),manualSpeedLabel=document.querySelector('label[for="rpm"]');stagedSpeedRow.className='staged-speed-row';rpmInput.parentNode.insertBefore(stagedSpeedRow,manualSpeedLabel);for(const [heading,id] of [['Manual','rpm'],['Auto','auto-rpm'],['Turn','turn-rpm']]){const input=document.getElementById(id),label=document.querySelector(`label[for="${id}"]`),cell=document.createElement('div');cell.innerHTML=`<h3>${heading}</h3>`;cell.append(label,input);if(id==='turn-rpm'){const timeout=document.getElementById('turn-timeout'),timeoutLabel=document.querySelector('label[for="turn-timeout"]');cell.append(timeoutLabel,timeout);}stagedSpeedRow.append(cell);}
 document.head.insertAdjacentHTML('beforeend','<style>.staged-speed-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:8px 0}.staged-speed-row h3{margin:0 0 2px;font-size:12px;color:#173d3a}.staged-speed-row label{font-size:10px}.staged-speed-row .speed-input{margin:2px 0 5px}@media(max-width:760px){.staged-speed-row{grid-template-columns:1fr}}</style>');
 document.head.insertAdjacentHTML('beforeend','<style>.compact-status{padding:9px 12px}.compact-status h2{display:inline;margin:0 10px 0 0;font-size:13px}.compact-status h3{display:inline;margin:0 5px 0 10px;font-size:10px}.compact-status .grid{display:inline-grid;grid-template-columns:repeat(5,minmax(62px,1fr));gap:3px;vertical-align:middle}.compact-status .metric{display:inline-block;border:0;padding:0 4px}.compact-status .label{font-size:8px}.compact-status .value{font-size:11px}.compact-status .fault{display:inline;margin:0 4px;font-size:9px;min-height:0}@media(max-width:1180px){.compact-status h3{display:block;margin:7px 0 2px}.compact-status .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}}</style>');
+document.head.insertAdjacentHTML('beforeend','<style>.config-section[data-config-group="rows"]{grid-column:1/-1}.row-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.row-zone-column{border:1px solid #dce5e7;border-radius:5px;padding:8px;background:#fff;min-width:0}.row-zone-column h4{margin:0 0 6px;color:#173d3a;font-size:12px}.row-zone-goal{display:grid;grid-template-columns:1fr;gap:5px}.row-zone-goal label{display:block;font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-goal input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.row-zone-group{border-top:1px solid #e5eaeb;margin-top:7px;padding-top:6px}.row-zone-group h5,.shared-turn-marker h4{margin:0 0 3px;color:#65727b;font-size:10px}.row-zone-inputs,.shared-turn-marker .config-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}.row-zone-inputs label,.shared-turn-marker label{font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-inputs input,.shared-turn-marker input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.shared-turn-marker{border-top:1px solid #dce5e7;margin-top:10px;padding-top:8px}.config-validation-warning{grid-column:1/-1;margin:0;color:var(--accent);font-size:11px;font-weight:700}@media(max-width:760px){.row-zone-grid{grid-template-columns:1fr}}</style>');
 // Compact controls are shared by both tabs.  The old selector made ``main``
 // itself a desktop grid and positioned direct children, which is invalid once
 // the panels are deliberately moved below their tab panes.
@@ -391,7 +440,7 @@ function atPath(value,path){return path.split('.').reduce((v,k)=>v?.[k],value)}
 function setPath(value,path,next){const keys=path.split('.');let target=value;for(const key of keys.slice(0,-1))target=target[key];target[keys.at(-1)]=next;}
 function leafEntries(value,prefix=''){if(Array.isArray(value))return [[prefix,value.join(',')]];if(value&&typeof value==='object')return Object.entries(value).flatMap(([key,item])=>leafEntries(item,prefix?`${prefix}.${key}`:key));return [[prefix,value]];}
 function isRpmPath(path){return path.endsWith('_rpm');}
-function configLabel(path){const match=path.match(/^vision\\.(navigation|trigger|pick)_zone(_2)?\\.x_distance$/);if(match)return `${match[1]}${match[2]?' 2':' 1'} x distance from x goal`;if(path==='vision.x_goal')return 'x goal 1';if(path==='vision.x_goal_2')return 'x goal 2';return isRpmPath(path)?`${path} (wheel RPM)`:path;}
+function configLabel(path){const match=path.match(/^vision\\.(navigation|trigger|pick)_zone(_2)?\\.x_distance$/);if(match)return `${match[1]}${match[2]?' 2':' 1'} x distance from x goal`;if(path==='vision.x_goal')return 'x_goal_1';if(path==='vision.x_goal_2')return 'x_goal_2';return isRpmPath(path)?`${path} (wheel RPM)`:path;}
 const configGroups=[
   ['rows','Radmål och zoner','x-goal samt navigations-, trigger- och pick-zoner för båda raderna.'],
   ['vision','Bild, HSV och perspektiv','Bildutsnitt, markbredd, HSV-filter och detektion.'],
@@ -411,8 +460,10 @@ function configGroupForPath(path){
   return 'general';
 }
 function migrateCentredLegacyZones(candidate){const next=structuredClone(candidate),vision=next.vision,goal=Number(vision?.x_goal);if(!Number.isFinite(goal))return next;for(const name of ['navigation','trigger','pick']){const key=`${name}_zone`,zone=vision[key];if(!zone||typeof zone!=='object'||'x_distance'in zone||!['x_min','x_max','y_min','y_max'].every(field=>typeof zone[field]==='number'))continue;const midpoint=(zone.x_min+zone.x_max)/2;if(Math.abs(midpoint-goal)>goalRelativeZoneMigrationTolerance)continue;vision[key]={x_distance:(zone.x_max-zone.x_min)/2,y_min:zone.y_min,y_max:zone.y_max};}return next;}
-function renderConfig(candidate){candidate=migrateCentredLegacyZones(candidate);profileCandidate=candidate;const ratio=Number(candidate.odometry_geometry?.motor_turns_per_wheel_turn);gearRatio=Number.isFinite(ratio)&&ratio>0?ratio:null;document.querySelectorAll('[data-direct]').forEach(el=>{const value=atPath(candidate,el.dataset.direct);if(el.type==='checkbox')el.checked=Boolean(value);else el.value=value??'';});const root=document.getElementById('config-fields');root.textContent='';const groups=new Map(configGroups.map(([id,title,description])=>{const section=document.createElement('section'),heading=document.createElement('h3'),note=document.createElement('p'),fields=document.createElement('div');section.className='config-section';section.dataset.configGroup=id;heading.textContent=title;note.textContent=description;fields.className='config-fields';section.append(heading,note,fields);root.append(section);return [id,fields];}));for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path))continue;const label=document.createElement('label');label.textContent=configLabel(path);const input=document.createElement('input');input.dataset.path=path;input.value=value===null?'':String(isRpmPath(path)?Number(value)/gearRatio:value);input.type=typeof value==='boolean'?'checkbox':'text';if(input.type==='checkbox')input.checked=value;label.append(input);groups.get(configGroupForPath(path)).append(label);}if(manualSpeedStatus)configureManualSpeed(manualSpeedStatus);}
-function candidateFromForm(){const candidate=structuredClone(profileCandidate);document.querySelectorAll('[data-direct]').forEach(el=>setPath(candidate,el.dataset.direct,el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value)));document.querySelectorAll('#config-fields input').forEach(el=>{const old=atPath(candidate,el.dataset.path);let value=el.type==='checkbox'?el.checked:el.value;if(Array.isArray(old))value=value.split(',').map(Number);else if(typeof old==='number')value=Number(value);else if(old===null&&value==='')value=null;if(isRpmPath(el.dataset.path))value*=gearRatio;setPath(candidate,el.dataset.path,value);});return candidate;}
+function rowZoneSlot(path,rowZones){const goal=path.match(/^vision\\.x_goal(_2)?$/);if(goal)return rowZones[goal[1]?1:0].goal;const zone=path.match(/^vision\\.(navigation|pick|trigger)_zone(_2)?\\.(.+)$/);if(!zone)return null;return rowZones[zone[2]?1:0].zones[zone[1]];}
+function rowZoneLabel(path){const leaf=path.split('.').at(-1);return leaf==='x_goal'?'x_goal_1':leaf==='x_goal_2'?'x_goal_2':leaf;}
+function renderConfig(candidate){candidate=migrateCentredLegacyZones(candidate);profileCandidate=candidate;const ratio=Number(candidate.odometry_geometry?.motor_turns_per_wheel_turn);gearRatio=Number.isFinite(ratio)&&ratio>0?ratio:null;document.querySelectorAll('[data-direct]').forEach(el=>{const value=atPath(candidate,el.dataset.direct);if(el.type==='checkbox')el.checked=Boolean(value);else el.value=value??'';});const root=document.getElementById('config-fields');root.textContent='';const groups=new Map(configGroups.map(([id,title,description])=>{const section=document.createElement('section'),heading=document.createElement('h3'),note=document.createElement('p'),fields=document.createElement('div');section.className='config-section';section.dataset.configGroup=id;heading.textContent=title;note.textContent=description;if(id==='rows'){const rows=[];fields.className='row-zone-grid';for(const rowTitle of ['Rad 1','Rad 2']){const column=document.createElement('section'),columnHeading=document.createElement('h4'),goal=document.createElement('div'),zones={};column.className='row-zone-column';columnHeading.textContent=rowTitle;goal.className='row-zone-goal';column.append(columnHeading,goal);for(const [zoneName,zoneTitle] of [['navigation','navigation_boundaries'],['pick','pick_boundaries'],['trigger','trigger_boundaries']]){const zone=document.createElement('section'),zoneHeading=document.createElement('h5'),inputs=document.createElement('div');zone.className='row-zone-group';zoneHeading.textContent=zoneTitle;inputs.className='row-zone-inputs';zone.append(zoneHeading,inputs);column.append(zone);zones[zoneName]=inputs;}fields.append(column);rows.push({goal,zones});}const shared=document.createElement('section'),sharedHeading=document.createElement('h4'),sharedFields=document.createElement('div');shared.className='shared-turn-marker';sharedHeading.textContent='Shared turn marker zone';sharedFields.className='config-fields';shared.append(sharedHeading,sharedFields);section.append(heading,note,fields,shared);root.append(section);return [id,{rows,shared:sharedFields}];}fields.className='config-fields';section.append(heading,note,fields);root.append(section);return [id,fields];}));const leftCircumference=Number(candidate.odometry_geometry?.left_wheel_circumference_m),rightCircumference=Number(candidate.odometry_geometry?.right_wheel_circumference_m),circumferencesMatch=Number.isFinite(leftCircumference)&&leftCircumference>0&&leftCircumference===rightCircumference;const circumferenceLabel=document.createElement('label'),circumferenceInput=document.createElement('input');circumferenceLabel.textContent='wheel_circumference_m';circumferenceInput.dataset.sharedWheelCircumference='true';circumferenceInput.name='wheel_circumference_m';circumferenceInput.type='number';circumferenceInput.min='0';circumferenceInput.step='any';if(circumferencesMatch)circumferenceInput.value=String(leftCircumference);else{circumferenceInput.placeholder='Set a common positive value';circumferenceLabel.title='Left and right wheel circumferences differ. Enter one common value before saving.';}circumferenceLabel.append(circumferenceInput);const odometryFields=groups.get('odometry');odometryFields.append(circumferenceLabel);if(!circumferencesMatch){const warning=document.createElement('p');warning.className='config-validation-warning';warning.textContent='Left and right wheel circumferences differ. Enter wheel_circumference_m to use one common value before saving.';odometryFields.append(warning);}for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path)||path==='odometry_geometry.left_wheel_circumference_m'||path==='odometry_geometry.right_wheel_circumference_m')continue;const groupId=configGroupForPath(path),rows=groupId==='rows'?groups.get('rows'):null,slot=rows?rowZoneSlot(path,rows.rows):null;const label=document.createElement('label');label.textContent=slot?rowZoneLabel(path):configLabel(path);const input=document.createElement('input');input.dataset.path=path;input.value=value===null?'':String(isRpmPath(path)?Number(value)/gearRatio:value);input.type=typeof value==='boolean'?'checkbox':'text';if(input.type==='checkbox')input.checked=value;label.append(input);if(rows){if(slot)slot.append(label);else rows.shared.append(label);}else groups.get(groupId).append(label);}if(manualSpeedStatus)configureManualSpeed(manualSpeedStatus);}
+function candidateFromForm(){const candidate=structuredClone(profileCandidate);document.querySelectorAll('[data-direct]').forEach(el=>setPath(candidate,el.dataset.direct,el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value)));document.querySelectorAll('#config-fields input[data-path]').forEach(el=>{const old=atPath(candidate,el.dataset.path);let value=el.type==='checkbox'?el.checked:el.value;if(Array.isArray(old))value=value.split(',').map(Number);else if(typeof old==='number')value=Number(value);else if(old===null&&value==='')value=null;if(isRpmPath(el.dataset.path))value*=gearRatio;setPath(candidate,el.dataset.path,value);});const sharedWheelCircumference=document.querySelector('[data-shared-wheel-circumference]'),wheelCircumference=Number(sharedWheelCircumference?.value);if(!Number.isFinite(wheelCircumference)||wheelCircumference<=0)throw new Error('wheel_circumference_m must be a positive common value for both wheels');candidate.odometry_geometry.left_wheel_circumference_m=wheelCircumference;candidate.odometry_geometry.right_wheel_circumference_m=wheelCircumference;return candidate;}
 const candidateFromFormBase=candidateFromForm;
 candidateFromForm=()=>{const candidate=candidateFromFormBase();document.querySelectorAll('[data-staged-rpm]').forEach(el=>{const wheelRpm=Number(el.value);if(!Number.isFinite(wheelRpm)||wheelRpm<=0)throw new Error('Staged wheel RPM must be positive');candidate[el.dataset.stagedRpm]=wheelRpm*gearRatio;});document.querySelectorAll('[data-staged-value]').forEach(el=>{const value=Number(el.value);if(!Number.isFinite(value)||value<=0)throw new Error('Staged value must be positive');setPath(candidate,el.dataset.stagedValue,value);});return candidate;};
 const renderConfigBase=renderConfig;
@@ -457,29 +508,34 @@ function configureManualSpeed(status){
   if(!speedInitialized){rpmInput.value=String(configuredRpm);speedInitialized=true;}
 }
 function manualRequestPath(path){
-  if(path==='/api/manual/hold')return path;
+  if(typeof manual.session!=='string'||!manual.session)throw new Error('Manual session is unavailable');
+  const parameters=new URLSearchParams({session:manual.session});
+  if(path==='/api/manual/hold')return `${path}?${parameters}`;
   const rpm=Number(rpmInput.value), maxRpm=Number(rpmInput.max);
   if(!Number.isFinite(rpm)||rpm<=0||!Number.isFinite(maxRpm)||maxRpm<=0||rpm>maxRpm){throw new Error('RPM must be positive and no greater than configured maximum');}
-  return `${path}?rpm=${encodeURIComponent(rpm)}`;
+  parameters.set('rpm',rpm);return `${path}?${parameters}`;
 }
 async function post(path){try{const r=await fetch(path,{method:'POST'});const p=await r.json();if(!r.ok) alert(p.error||'Command rejected');return r.ok}catch(e){alert('Request failed');return false}}
-// Manual HTTP delivery deliberately has one request in flight.  Slow or lost
+// Manual HTTP delivery deliberately has one request in flight. Slow or lost
 // browser requests therefore cannot become an unbounded queue of stale drive
-// commands.  Pointer release changes to a lease-refreshing zero command;
-// explicit STOP, loss of page visibility and failed delivery remain hard
-// stop/disarm actions. Runtime-side lease expiry is the independent backstop.
+// commands. Release cancels the periodic sender and sends one STOP
+// immediately. The server invalidates the session before STOP returns, so an
+// already-sent direction with that session cannot reclaim output afterwards.
+// Runtime-side lease expiry remains the independent backstop on connection loss.
 restartApplicationButton.addEventListener('click',async()=>{try{restartApplicationButton.disabled=true;const previousStatus=dashboardInstanceId?{instance_id:dashboardInstanceId}:await restartStatus();if(!previousStatus?.instance_id)throw new Error('Could not identify the running application');const response=await fetch('/api/application/restart',{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error);text('config-note','Restarting application; reconnecting automatically…');void reconnectAfterRestart(previousStatus.instance_id);}catch(error){text('config-note',`Restart failed: ${error.message}`);restartApplicationButton.disabled=false;}});
 resetRowProgressButton.addEventListener('click',async()=>{if(await post('/api/reset-row-progress'))refresh();});
-const manual={active:false,path:null,pointerId:null,timer:null,inFlight:false,controller:null,stopping:false};
+const manual={active:false,path:null,pointerId:null,session:null,epoch:null,starting:false,startGeneration:0,timer:null,inFlight:false,controller:null,stopping:false,pendingStart:null};
 function clearManualTimer(){if(manual.timer!==null){clearInterval(manual.timer);manual.timer=null;}}
-function stopManual(){manual.active=false;manual.path=null;manual.pointerId=null;clearManualTimer();if(manual.controller)manual.controller.abort();if(manual.stopping)return;manual.stopping=true;fetch('/api/stop',{method:'POST'}).then(async r=>{if(!r.ok){const p=await r.json().catch(()=>({}));throw new Error(p.error||'STOP rejected')}}).catch(()=>{text('fault','Manual STOP request failed; runtime lease will stop output')}).finally(()=>{manual.stopping=false;});}
-function stopManualIfActive(){if(manual.active||manual.inFlight||manual.pointerId!==null||manual.path!==null)stopManual();}
+function observeManualEpoch(status){const epoch=status?.physical_web_standby?.manual_web_epoch;if(typeof epoch==='string'&&epoch)manual.epoch=epoch;}
+function sendManualStop(){if(manual.stopping)return;manual.stopping=true;fetch('/api/stop',{method:'POST'}).then(async r=>{const p=await r.json().catch(()=>({}));if(!r.ok)throw new Error(p.error||'STOP rejected');observeManualEpoch(p);}).catch(()=>{text('fault','Manual STOP request failed; runtime lease will stop output')}).finally(()=>{manual.stopping=false;const pending=manual.pendingStart;manual.pendingStart=null;if(pending){refresh().finally(()=>holdManual(pending.path,pending.pointerId));}});}
+function stopManual(){const hadSession=manual.active||manual.starting||manual.inFlight||manual.pointerId!==null||manual.path!==null||manual.session!==null;manual.startGeneration++;manual.active=false;manual.starting=false;manual.path=null;manual.pointerId=null;manual.session=null;clearManualTimer();if(hadSession)sendManualStop();}
+function stopManualIfActive(){stopManual();}
 function sendManual(){if(!manual.active||manual.inFlight||manual.stopping)return;let path;try{path=manualRequestPath(manual.path)}catch(error){text('fault',`Manual request failed: ${error.message}; STOP sent`);stopManual();return;}manual.inFlight=true;manual.controller=new AbortController();fetch(path,{method:'POST',signal:manual.controller.signal}).then(async r=>{if(!r.ok){const p=await r.json().catch(()=>({}));throw new Error(p.error||'Manual command rejected')}}).catch(error=>{if(error.name!=='AbortError'){text('fault',`Manual request failed: ${error.message}; STOP sent`);stopManual();}}).finally(()=>{manual.inFlight=false;manual.controller=null;});}
-function holdManual(path,pointerId){if(manual.active&&manual.pointerId!==null&&manual.pointerId!==pointerId)stopManual();manual.active=true;manual.path=path;manual.pointerId=pointerId;sendManual();clearManualTimer();manual.timer=setInterval(sendManual,100);}
-function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}
+async function holdManual(path,pointerId){if(manual.stopping){manual.pendingStart={path,pointerId};return;}if(manual.active&&manual.pointerId!==null&&manual.pointerId!==pointerId){stopManual();manual.pendingStart={path,pointerId};return;}if(typeof manual.epoch!=='string'||!manual.epoch){text('fault','Manual session unavailable; wait for current standby status');return;}manual.active=true;manual.starting=true;manual.path=path;manual.pointerId=pointerId;manual.session=null;const generation=++manual.startGeneration;try{const response=await fetch(`/api/manual/session?epoch=${encodeURIComponent(manual.epoch)}`,{method:'POST'});const data=await response.json();if(!response.ok)throw new Error(data.error||'Manual session rejected');if(!manual.active||manual.pointerId!==pointerId||generation!==manual.startGeneration)return;manual.session=data.session;manual.starting=false;sendManual();clearManualTimer();manual.timer=setInterval(sendManual,100);}catch(error){if(generation!==manual.startGeneration)return;text('fault',`Manual session failed: ${error.message}; STOP sent`);stopManual();}}
+function releaseManual(pointerId){if(manual.pendingStart&&manual.pendingStart.pointerId===pointerId)manual.pendingStart=null;if(manual.active&&manual.pointerId===pointerId)stopManual();}
 document.querySelectorAll('[data-manual-path]').forEach(button=>{const down=e=>{e.preventDefault();button.setPointerCapture?.(e.pointerId);holdManual(button.dataset.manualPath,e.pointerId)};const up=e=>{e.preventDefault();releaseManual(e.pointerId)};button.addEventListener('pointerdown',down);['pointerup','pointercancel','pointerleave'].forEach(event=>button.addEventListener(event,up));});
 document.getElementById('stop').addEventListener('click',stopManual);window.addEventListener('blur',stopManualIfActive);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopManualIfActive()});
-async function refresh(){try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();if(typeof p.instance_id==='string')dashboardInstanceId=p.instance_id;const manualReady=p.mode==='MANUAL'&&p.physical_web_standby.active;configureManualSpeed(p);text('state',p.state);text('state2',p.state);text('mode',p.mode);text('row',`${p.row_number} / ${p.pass_number}`);text('armed',p.motor_output_armed?'ARMED':'DISARMED');text('standby',p.physical_web_standby.active?'READY (no motion)':'-');document.getElementById('manual-mode').disabled=manualReady;text('manual-help',manualReady?'Manual is already ready. Hold a direction button; do not press MANUAL.':'Select MANUAL before using a direction button. Hold a manual button to drive.');text('fault',p.fault||'');text('odometry-warning','');text('camera',p.camera.ok?'OK':'FAULT');text('imu',p.imu.ok?'OK':'FAULT');text('camera-age',fmt(p.camera.age_s,' s'));text('imu-age',fmt(p.imu.age_s,' s'));text('heading',fmt(p.heading.filtered_heading_deg,' deg'));text('reference',fmt(p.heading.row_heading_reference_deg,' deg'));text('heading-error',fmt(p.heading.heading_error_deg,' deg'));text('build-distance',fmt(p.heading.reference_build_distance_m,' m'));text('target',`${fmt(p.vision.target_x_px,' px')} / ${fmt(p.vision.x_goal_px,' px')}`);text('marker',p.vision.marker_found?'FOUND':'-');text('distance',fmt(p.odometry.distance_m,' m'));text('search',fmt(p.search_distance_m,' m'));}catch(e){text('fault','Diagnostics unavailable')}}
+async function refresh(){try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();if(typeof p.instance_id==='string')dashboardInstanceId=p.instance_id;observeManualEpoch(p);const manualReady=p.mode==='MANUAL'&&p.physical_web_standby.active;configureManualSpeed(p);text('state',p.state);text('state2',p.state);text('mode',p.mode);text('row',`${p.row_number} / ${p.pass_number}`);text('armed',p.motor_output_armed?'ARMED':'DISARMED');text('standby',p.physical_web_standby.active?'READY (no motion)':'-');document.getElementById('manual-mode').disabled=manualReady;text('manual-help',manualReady?'Manual is already ready. Hold a direction button; do not press MANUAL.':'Select MANUAL before using a direction button. Hold a manual button to drive.');text('fault',p.fault||'');text('odometry-warning','');text('camera',p.camera.ok?'OK':'FAULT');text('imu',p.imu.ok?'OK':'FAULT');text('camera-age',fmt(p.camera.age_s,' s'));text('imu-age',fmt(p.imu.age_s,' s'));text('heading',fmt(p.heading.filtered_heading_deg,' deg'));text('reference',fmt(p.heading.row_heading_reference_deg,' deg'));text('heading-error',fmt(p.heading.heading_error_deg,' deg'));text('build-distance',fmt(p.heading.reference_build_distance_m,' m'));text('target',`${fmt(p.vision.target_x_px,' px')} / ${fmt(p.vision.x_goal_px,' px')}`);text('marker',p.vision.marker_found?'FOUND':'-');text('distance',fmt(p.odometry.distance_m,' m'));text('search',fmt(p.search_distance_m,' m'));}catch(e){text('fault','Diagnostics unavailable')}}
 const refreshBase=refresh;refresh=async()=>{await refreshBase();try{const p=await (await fetch('/api/status',{cache:'no-store'})).json();const state=p.state;if(state==='MANUAL')text('navigation-state',p.mode==='AUTO'?'AUTO selected — press Start Auto':'MANUAL');else if(state==='AUTO_ROW_FOLLOW')text('navigation-state',p.navigation_mode==='buds_and_leaves'?'AUTO buds + leaves navigation':'AUTO bud navigation');else if(state==='AUTO_SEARCH')text('navigation-state','AUTO IMU-only navigation');else if(state==='AUTO_IN_ROW_TURN')text('navigation-state','In-row turn');else if(state==='AUTO_NEW_ROW_TURN')text('navigation-state','New-row turn');else if(state==='AUTO_PICK')text('navigation-state','Pick active');else if(state==='AUTO_POST_PICK')text('navigation-state','Post-pick navigation');else if(state==='AUTO_START_DELAY')text('navigation-state','AUTO start delay');else if(state==='AUTO_COMPLETE')text('navigation-state','AUTO complete');else if(state==='FAULT')text('navigation-state',`FAULT: ${p.fault||p.state_reason||''}`);else text('navigation-state',state);}catch(_){}};
 refresh();setInterval(refresh,1000);
 loadConfig();

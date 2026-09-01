@@ -211,6 +211,26 @@ class VisionTests(unittest.TestCase):
         self.assertGreater(fallback.target_x, 14)
         self.assertTrue(fallback.bud_in_trigger_zone); self.assertTrue(fallback.bud_in_pick_zone)
 
+    def test_leaf_in_either_trigger_zone_never_triggers_pick(self):
+        """Trigger membership is deliberately evaluated from the bud mask only."""
+        green = HsvFilter((55, 200, 200), (65, 255, 255), 4)
+        no_buds = HsvFilter((100, 200, 200), (110, 255, 255), 4)
+        cfg = VisionConfig(
+            navigation_mode="buds_and_leaves", buds=no_buds, leaves=green,
+            navigation_zone=Zone(0, .45, 0, 1), navigation_zone_2=Zone(.55, 1, 0, 1),
+            trigger_zone=Zone(0, .45, .5, 1), trigger_zone_2=Zone(.55, 1, .5, 1),
+            pick_zone=Zone(0, .45, .5, 1), pick_zone_2=Zone(.55, 1, .5, 1),
+        )
+        hsv = np.zeros((20, 20, 3), dtype=np.uint8)
+        # A qualifying leaf in row 2 is a valid navigation target in this
+        # mode, but must never produce a harvest trigger or pick-zone hold.
+        hsv[12:16, 15:19] = (60, 255, 255)
+        result = VisionProcessor().process(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR), 1, cfg)
+        self.assertEqual(result.master_row, 2)
+        self.assertIsNotNone(result.target_x)
+        self.assertFalse(result.bud_in_trigger_zone)
+        self.assertFalse(result.bud_in_pick_zone)
+
     def test_dual_rows_keep_filter_histories_independent_and_draw_both_guides(self):
         red = HsvFilter((0, 200, 200), (5, 255, 255), 4)
         cfg = VisionConfig(navigation_mode="buds_only", buds=red,

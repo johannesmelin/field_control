@@ -383,7 +383,9 @@ class RuntimeConfig:
     camera_timeout_s: float = .5
     imu_timeout_s: float = .5
     odometry_timeout_s: float = .5
-    control_lease_timeout_s: float = .3
+    # Active manual control must be refreshed within this interval.  A lost
+    # browser/client therefore reaches the runtime stop path deterministically.
+    control_lease_timeout_s: float = 1.0
     watchdog_period_s: float = .02
     max_control_stall_s: float = .12
     # Deprecated compatibility value. Physical web standby is indefinitely
@@ -472,8 +474,8 @@ class RuntimeConfig:
             raise ValueError("watchdogperiod måste vara positiv och högst 20 ms")
         if not 0 < self.max_control_stall_s <= .120:
             raise ValueError("maximal styrloopstall måste vara positiv och högst 120 ms")
-        if self.control_lease_timeout_s > .500:
-            raise ValueError("control-lease-timeout får vara högst 500 ms")
+        if self.control_lease_timeout_s > 1.0:
+            raise ValueError("control-lease-timeout får vara högst 1 s")
         dimensions = (self.processing_width, self.processing_height, self.stream_width, self.stream_height)
         if any(value < 1 for value in dimensions) or self.jpeg_quality not in range(1, 101):
             raise ValueError("bilddimensioner och JPEG-kvalitet är ogiltiga")

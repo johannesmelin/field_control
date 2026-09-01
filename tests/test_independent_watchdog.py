@@ -211,7 +211,10 @@ class IndependentWatchdogTests(unittest.TestCase):
         runtime.start(); runtime.arm_motor_output()
         now[0] = .11
         deadline = time.monotonic() + .5
-        while runtime.machine.state is not State.FAULT and time.monotonic() < deadline:
+        # The recoverable watchdog path records the causal FAULT before it
+        # atomically publishes armed MANUAL web standby.  Wait for that final
+        # handoff rather than observing the intentional transient state.
+        while (runtime.machine.state is not State.MANUAL or not runtime.web_standby_status()[0]) and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertEqual(runtime.status().fault, "CONTROL_LEASE_EXPIRED")
         self.assertTrue(sink.stops)
@@ -220,6 +223,62 @@ class IndependentWatchdogTests(unittest.TestCase):
         runtime.manual_command(WheelCommand(1, 1, "after lease expiry"))
         self.assertEqual(sink.commands[-1], (1, 1, "after lease expiry"))
         runtime.close()
+
+    def test_expired_control_refresh_and_watchdog_race_retains_armed_standby(self):
+        """Either expiry observer may linearize first, never ordinary-disarm.
+
+        This reproduces the former race where a periodic AUTO refresh could
+        invoke the lease's ordinary revoke callback just before the watchdog
+        published its recoverable no-motion hand-off.
+        """
+        runtime, sink, now = self.make_runtime(lease_timeout=.1)
+        runtime.start(); runtime.arm_motor_output()
+        now[0] = .11
+        gate = threading.Barrier(3); errors = []
+        def refresh_tick():
+            try:
+                gate.wait(.5)
+                runtime._refresh_active_lease(State.AUTO_ROW_FOLLOW)
+            except Exception as exc:
+                errors.append(exc)
+        def watchdog():
+            try:
+                gate.wait(.5)
+                runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            tick_thread = threading.Thread(target=refresh_tick)
+            watchdog_thread = threading.Thread(target=watchdog)
+            tick_thread.start(); watchdog_thread.start(); gate.wait(.5)
+            tick_thread.join(.5); watchdog_thread.join(.5)
+            self.assertFalse(tick_thread.is_alive())
+            self.assertFalse(watchdog_thread.is_alive())
+            # Tick dispatch translates its refresh exception through the
+            # existing recoverable fault path after this boundary hand-off.
+            runtime._fail_closed(CONTROL_LEASE_EXPIRED)
+            # The control tick reports the expired lease, but its boundary
+            # callback has already queued a zero and retained standby.
+            self.assertTrue(errors)
+            self.assertTrue(sink.stops)
+            self.assertTrue(runtime.motor.armed)
+            self.assertTrue(runtime.motor.web_standby_active)
+            self.assertIsNone(runtime._lease_token)
+        finally:
+            runtime.close()
+
+    def test_expired_command_admission_retains_armed_standby(self):
+        runtime, sink, now = self.make_runtime(lease_timeout=.1)
+        runtime.start(); runtime.arm_motor_output()
+        now[0] = .11
+        try:
+            with self.assertRaises(RuntimeError):
+                runtime.manual_command(WheelCommand(3, 3, "expired command"))
+            self.assertTrue(sink.stops)
+            self.assertTrue(runtime.motor.armed)
+            self.assertTrue(runtime.motor.web_standby_active)
+        finally:
+            runtime.close()
 
     def test_row_lost_stops_to_armed_manual_standby_then_manual_claims_fresh_lease(self):
         runtime, sink, _now = self.make_runtime()

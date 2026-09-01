@@ -398,9 +398,9 @@ Robotens sökkörning får aldrig fortsätta obegränsat.
 
 # 13. Trigger för skörd
 
-När en saffransknopp detekteras i:
+När en saffransknopp (aldrig blast) detekteras i någon av:
 
-`trigger_zone`
+`trigger_zone` eller `trigger_zone_2`
 
 ska båda motorerna stanna.
 
@@ -412,7 +412,7 @@ eller, om relevant:
 
 `AUTO_SEARCH -> AUTO_PICK`
 
-Knoppar i `trigger_zone` får endast trigga stopp när triggerfunktionen är aktiverad.
+Knoppar i endera triggerzonen får endast trigga stopp när triggerfunktionen är aktiverad.
 
 ---
 
@@ -454,14 +454,14 @@ Syftet är att undvika att samma knopp eller samma skördeområde omedelbart tri
 
 Under `AUTO_POST_PICK`:
 
-* ignorera knoppar i `trigger_zone` för stopp,
+* ignorera knoppar i båda triggerzonerna för stopp,
 * använd normal visuell radföljning om giltiga navigationsmål finns,
 * använd `row_heading_reference` om visuella navigationsmål saknas,
 * använd dödräkning för att mäta körd sträcka.
 
 När roboten har kört minst:
 
-`post_pick_lockout_distance_m`
+`post_pick_lockout_distance_m` (gemensam för båda triggerzonerna)
 
 ska triggerfunktionen återaktiveras.
 
@@ -619,6 +619,16 @@ Följande geometriparametrar ska vara konfigurerbara:
 * `wheel_track_m`
 
 Använd separata hjulomkretsar så att mindre skillnader mellan hjulen kan kalibreras individuellt.
+
+De kanoniska konfigurations-/JSON-fälten förblir
+`left_wheel_circumference_m` och `right_wheel_circumference_m`, så befintliga
+profiler med separata värden fortsatt kan läsas. I webbgränssnittet anges
+däremot den användargodkända gemensamma parametern `wheel_circumference_m`.
+Vid sparande eller konfigurationsomstart ska ett giltigt positivt värde
+atomärt skrivas till båda kanoniska fälten. Om ett inläst profilvärde skiljer
+sig mellan hjulen ska gränssnittet visa detta och kräva att operatören anger
+ett nytt gemensamt värde; det får aldrig tyst välja eller skriva över ett av
+de separata värdena.
 
 `wheel_track_m` definieras som avståndet mellan centrumlinjerna för vänster respektive höger drivhjul.
 
@@ -1306,6 +1316,7 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `left_wheel_circumference_m`  | Effektiv omkrets på vänster drivhjul. Används för dödräkning och kan kalibreras separat.                            |
 | `right_wheel_circumference_m` | Effektiv omkrets på höger drivhjul.                                                                                 |
+| `wheel_circumference_m`       | Endast webbgränssnitt: ett positivt gemensamt operatörsvärde som vid sparande/omstart skrivs till båda kanoniska hjulomkretsfälten. Separata JSON-värden förblir läsbara men redigeras inte var för sig i UI:t. |
 | `wheel_track_m`               | Avstånd mellan vänster och höger drivhjuls centrumlinjer. Används i differentialkinematik och vändningsberäkningar. |
 | `odometry_timeout_s`          | Maximal tillåten tid utan giltig odometridata innan motorerna stoppas och systemet går till `FAULT`.                |
 

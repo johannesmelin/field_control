@@ -209,16 +209,42 @@ class _VerifiedPhysicalMotorBoundary:
                 right = max(-self._max_rpm, min(self._max_rpm, command.right_rpm))
                 self._sink.command(left, right, command.source)
                 self.events.append(("drive", left, right, command.source))
-        if not self._lease.run_if_valid(active, admit):
+        admitted = self._lease.run_if_valid_or_revoke(
+                active, admit,
+                lambda: self._prepare_recoverable_expiry(active, "CONTROL_LEASE_EXPIRED"))
+        if admitted is None:
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
+        if not admitted:
+            # A stale bearer token is not an expiry race.  Preserve the
+            # established fail-closed treatment of an unauthorised command.
             self.stop_all("control-lease saknas eller har löpt ut")
             raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
 
     def hold_stopped(self, reason: str, token: str | None = None) -> None:
-        if not self._lease.valid(token):
+        def admit() -> None:
+            self._sink.stop_all(reason)
+            self.events.append(("hold-stop", 0.0, 0.0, reason))
+        admitted = self._lease.run_if_valid_or_revoke(
+                token, admit,
+                lambda: self._prepare_recoverable_expiry(token, "CONTROL_LEASE_EXPIRED"))
+        if admitted is None:
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
+        if not admitted:
             self.stop_all(reason)
             raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
-        self._sink.stop_all(reason)
-        self.events.append(("hold-stop", 0.0, 0.0, reason))
+
+    def refresh_lease_or_recover_expired(self, token: str | None,
+                                          reason: str = "CONTROL_LEASE_EXPIRED") -> None:
+        """Refresh active command authority without an ordinary-disarm gap.
+
+        Lease expiry is checked and the recoverable boundary hand-off is
+        prepared under the same lease lock.  A periodic control tick can
+        therefore not revoke normally between expiry detection and runtime
+        recovery publication.
+        """
+        if not self._lease.refresh_or_revoke(
+                token, lambda: self._prepare_recoverable_expiry(token, reason)):
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
 
     def enter_web_standby(self, token: str | None) -> None:
         """Atomically exchange a just-armed drive lease for no-motion standby."""
@@ -256,23 +282,32 @@ class _VerifiedPhysicalMotorBoundary:
                                   tolerance_wheel_degrees: float, timeout_s: float,
                                   deadline_s: float,
                                   token: str | None = None) -> object:
-        if not self._lease.valid(token):
-            self.stop_all("A4-positionering saknar control-lease")
-            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
         if (not isinstance(max_motor_rpm, (int, float)) or isinstance(max_motor_rpm, bool)
                 or not math.isfinite(max_motor_rpm) or max_motor_rpm <= 0):
             raise ValueError("A4 max-rpm måste vara positiv och ändlig")
         max_motor_rpm = min(float(max_motor_rpm), self._max_rpm)
-        with self._lock:
-            if self._closing or self._closed or self._fault_reason is not None or token != self._armed_token:
-                raise PhysicalOutputDisabled("motorutgång är inte armerad för A4-positionering")
-            request = self._sink.begin_wheel_position_move(
-                left_wheel_degrees=left_wheel_degrees, right_wheel_degrees=right_wheel_degrees,
-                max_motor_rpm=max_motor_rpm, motor_turns_per_wheel_turn=motor_turns_per_wheel_turn,
-                tolerance_wheel_degrees=tolerance_wheel_degrees, timeout_s=timeout_s, deadline_s=deadline_s,
-            )
-            self.events.append(("position", left_wheel_degrees, right_wheel_degrees, "turn A4"))
-            return request
+        request: object | None = None
+        def admit() -> None:
+            nonlocal request
+            with self._lock:
+                if self._closing or self._closed or self._fault_reason is not None or token != self._armed_token:
+                    raise PhysicalOutputDisabled("motorutgång är inte armerad för A4-positionering")
+                request = self._sink.begin_wheel_position_move(
+                    left_wheel_degrees=left_wheel_degrees, right_wheel_degrees=right_wheel_degrees,
+                    max_motor_rpm=max_motor_rpm, motor_turns_per_wheel_turn=motor_turns_per_wheel_turn,
+                    tolerance_wheel_degrees=tolerance_wheel_degrees, timeout_s=timeout_s, deadline_s=deadline_s,
+                )
+                self.events.append(("position", left_wheel_degrees, right_wheel_degrees, "turn A4"))
+        admitted = self._lease.run_if_valid_or_revoke(
+                token, admit,
+                lambda: self._prepare_recoverable_expiry(token, "CONTROL_LEASE_EXPIRED"))
+        if admitted is None:
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
+        if not admitted:
+            self.stop_all("A4-positionering saknar control-lease")
+            raise PhysicalOutputDisabled("control-lease saknas eller har löpt ut")
+        assert request is not None
+        return request
 
     def position_move_status(self, request: object) -> tuple[bool, bool, str | None, bool]:
         status = self._sink.position_move_status(request)
@@ -390,6 +425,19 @@ class _VerifiedPhysicalMotorBoundary:
         with self._lock:
             self._recoverable_revoke_reason = None
         return False
+
+    def _prepare_recoverable_expiry(self, token: str | None, reason: str) -> None:
+        """Mark the *currently expiring* active lease as recoverable.
+
+        This executes under ``ControlLease``'s lock.  The lock ordering is
+        lease then boundary, matching command admission.  A fault or close
+        deliberately leaves the callback on its ordinary fail-closed path.
+        """
+        with self._lock:
+            if (self._closing or self._closed or self._fault_reason is not None
+                    or token is None or token != self._armed_token):
+                return
+            self._recoverable_revoke_reason = reason
 
     def close(self) -> None:
         if not self._begin_close():

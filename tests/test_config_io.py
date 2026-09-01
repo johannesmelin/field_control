@@ -115,10 +115,11 @@ class ConfigIoTests(unittest.TestCase):
         config = RuntimeConfig(physical_web_standby_timeout_s=999999.0)
         self.assertIs(config.validate(), config)
 
-    def test_control_lease_timeout_allows_500ms_but_rejects_longer(self):
-        self.assertEqual(RuntimeConfig(control_lease_timeout_s=.5).validate().control_lease_timeout_s, .5)
-        with self.assertRaisesRegex(ValueError, "högst 500 ms"):
-            RuntimeConfig(control_lease_timeout_s=.500001).validate()
+    def test_control_lease_timeout_defaults_to_one_second_and_rejects_longer(self):
+        self.assertEqual(RuntimeConfig().validate().control_lease_timeout_s, 1.0)
+        self.assertEqual(RuntimeConfig(control_lease_timeout_s=1.0).validate().control_lease_timeout_s, 1.0)
+        with self.assertRaisesRegex(ValueError, "högst 1 s"):
+            RuntimeConfig(control_lease_timeout_s=1.000001).validate()
 
     def test_legacy_zones_load_unchanged_and_perspective_vision_round_trips(self):
         legacy = runtime_config_from_dict({"vision": {"navigation_zone": {

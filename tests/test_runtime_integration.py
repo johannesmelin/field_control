@@ -2,6 +2,7 @@ import unittest
 import threading
 import time
 import io
+from dataclasses import replace
 
 from field_control.config import PhysicalCanConfig, RuntimeConfig, VisionConfig
 from field_control.control import WheelCommand
@@ -14,7 +15,7 @@ from field_control.sources import OdometrySource, RightEncoderReplyTimeout
 from field_control.odometry import DriveGeometry, OdometrySample
 from field_control.turn import new_row_turn_plan
 from field_control.lease import ControlLease
-from field_control.runtime import FieldControlRuntime, _Lifecycle
+from field_control.runtime import CONTROL_LEASE_EXPIRED, FieldControlRuntime, _Lifecycle
 from field_control.state_machine import Observation as MachineObservation, State
 from field_control.web import DiagnosticsServer
 from unittest.mock import patch
@@ -1132,6 +1133,65 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(runtime._odometry.manual_paused)
             runtime.stop()
             self.assertEqual(motor.stops[-1], "STOP")
+        finally:
+            runtime.close()
+
+    def test_web_session_fences_delayed_manual_commands_after_stop_and_expiry(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Angles:
+            def angles(self): return 0.0, 0.0
+            def close(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = False; self.standby = False; self.commands = []; self.stops = []
+            def arm(self, _token): self.armed = True
+            def enter_web_standby(self, _token): self.standby = True
+            def claim_web_standby(self, _token): self.standby = False
+            def recoverable_stop_to_web_standby(self, reason): self.standby = True; self.stops.append(reason); return True
+            def command(self, command, _token): self.commands.append(command)
+            def stop_all(self, reason): self.armed = False; self.standby = False; self.stops.append(reason)
+
+        class BlockingRuntime(FieldControlRuntime):
+            def _run(self): self._stop.wait()
+
+        motor = Physical()
+        runtime = BlockingRuntime(replace(self._physical_config(), control_lease_timeout_s=.05), PassiveSource(), PassiveSource(),
+                                  motor=motor, odometry=OdometrySource(Angles(), DriveGeometry()))
+        runtime.start()
+        try:
+            self.assertTrue(runtime._odometry.wait_until_ready(.2))
+            runtime.arm_motor_output_for_web_standby()
+            old_epoch = runtime.manual_web_epoch()
+            old = runtime.begin_manual_web_session(old_epoch)
+            runtime.manual_web_command(old, WheelCommand(3, 3, "web"))
+            self.assertEqual(len(motor.commands), 1)
+
+            runtime.stop()
+            with self.assertRaisesRegex(ValueError, "inaktuell freshness-epoch"):
+                runtime.begin_manual_web_session(old_epoch)
+            with self.assertRaisesRegex(ValueError, "webbsession"):
+                runtime.manual_web_command(old, WheelCommand(3, 3, "delayed-after-stop"))
+            self.assertEqual(len(motor.commands), 1)
+
+            fresh = runtime.begin_manual_web_session(runtime.manual_web_epoch())
+            self.assertNotEqual(old, fresh)
+            with self.assertRaisesRegex(ValueError, "webbsession"):
+                runtime.manual_web_command(old, WheelCommand(3, 3, "duplicate-old"))
+            runtime.manual_web_command(fresh, WheelCommand(3, 3, "fresh"))
+            self.assertEqual(len(motor.commands), 2)
+
+            # The independent lease path recovers to no-motion standby and
+            # invalidates the active browser token before a delayed request
+            # can claim it again.
+            time.sleep(.08)
+            runtime._watchdog_revoke_if_running(CONTROL_LEASE_EXPIRED)
+            with self.assertRaisesRegex(ValueError, "webbsession"):
+                runtime.manual_web_command(fresh, WheelCommand(3, 3, "delayed-after-expiry"))
+            self.assertEqual(len(motor.commands), 2)
         finally:
             runtime.close()
 

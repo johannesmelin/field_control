@@ -18,6 +18,7 @@ class FakeRuntime:
     def __init__(self, rpm=6.0, error: Exception | None = None):
         self.config = SimpleNamespace(manual_rpm=rpm, max_rpm=10.0, stream_fps=5)
         self.commands = []; self.error = error
+        self.web_session = "test-session"; self.session_count = 0; self.web_epoch = "test-epoch"
         self.images = {}
         self.row_reset_calls = 0
         self.application_restart_calls = 0
@@ -26,10 +27,17 @@ class FakeRuntime:
     def manual_command(self, command):
         if self.error is not None: raise self.error
         self.commands.append(command)
+    def begin_manual_web_session(self, epoch):
+        if epoch != self.web_epoch: raise ValueError("manuell webbsession har en inaktuell freshness-epoch")
+        self.session_count += 1; self.web_session = f"session-{self.session_count}"
+        return self.web_session
+    def manual_web_command(self, session, command):
+        if session != self.web_session: raise ValueError("manuell webbsession är utgången eller ogiltig")
+        self.manual_command(command)
     def select_manual(self): pass
     def select_auto(self): pass
     def start_auto(self): pass
-    def stop(self): pass
+    def stop(self): self.web_session = None; self.web_epoch = f"epoch-after-{self.session_count}"
     def reset_row_progress(self): self.row_reset_calls += 1
     def begin_application_restart(self): self.application_restart_calls += 1
     def latest_image(self, view): return self.images.get(view)
@@ -346,7 +354,7 @@ class ManualWebTests(unittest.TestCase):
         }
         for path, values in expected.items():
             with self.subTest(path=path):
-                status, body = self.request(runtime, path)
+                status, body = self.request(runtime, f"{path}?session=test-session")
                 self.assertEqual((status, body), (200, {"ok": True}))
                 command = runtime.commands[-1]
                 self.assertEqual((command.left_rpm, command.right_rpm), values)
@@ -364,7 +372,7 @@ class ManualWebTests(unittest.TestCase):
         }
         for path, values in expected.items():
             with self.subTest(path=path):
-                status, body = self.request(runtime, path)
+                status, body = self.request(runtime, f"{path}?session=test-session")
                 self.assertEqual((status, body), (200, {"ok": True}))
                 command = runtime.commands[-1]
                 self.assertEqual(
@@ -374,21 +382,21 @@ class ManualWebTests(unittest.TestCase):
 
     def test_direction_routes_accept_one_finite_positive_rpm_within_configured_maximum(self):
         runtime = FakeRuntime(6.0)
-        status, body = self.request(runtime, "/api/manual/both/forward?rpm=7.5")
+        status, body = self.request(runtime, "/api/manual/both/forward?rpm=7.5&session=test-session")
         self.assertEqual((status, body), (200, {"ok": True}))
         command = runtime.commands[-1]
         self.assertEqual((command.left_rpm, command.right_rpm), (7.5, 7.5))
 
     def test_direction_routes_reject_malformed_multiple_nonfinite_or_out_of_range_rpm(self):
         rejected = (
-            "/api/manual/both/forward?rpm=",
-            "/api/manual/both/forward?rpm=NaN",
-            "/api/manual/both/forward?rpm=Infinity",
-            "/api/manual/both/forward?rpm=-1",
-            "/api/manual/both/forward?rpm=10.1",
-            "/api/manual/both/forward?rpm=2&rpm=3",
-            "/api/manual/both/forward?rpm=2&other=3",
-            "/api/manual/both/forward?rpm",
+            "/api/manual/both/forward?rpm=&session=test-session",
+            "/api/manual/both/forward?rpm=NaN&session=test-session",
+            "/api/manual/both/forward?rpm=Infinity&session=test-session",
+            "/api/manual/both/forward?rpm=-1&session=test-session",
+            "/api/manual/both/forward?rpm=10.1&session=test-session",
+            "/api/manual/both/forward?rpm=2&rpm=3&session=test-session",
+            "/api/manual/both/forward?rpm=2&other=3&session=test-session",
+            "/api/manual/both/forward?rpm&session=test-session",
         )
         for path in rejected:
             with self.subTest(path=path):
@@ -400,17 +408,49 @@ class ManualWebTests(unittest.TestCase):
 
     def test_zero_hold_route_uses_the_same_manual_runtime_gate_without_client_rpm(self):
         runtime = FakeRuntime(0.0)
-        status, body = self.request(runtime, "/api/manual/hold")
+        status, body = self.request(runtime, "/api/manual/hold?session=test-session")
         self.assertEqual((status, body), (200, {"ok": True}))
         command = runtime.commands[-1]
         self.assertEqual((command.left_rpm, command.right_rpm, command.source), (0.0, 0.0, "web-manual-hold"))
 
     def test_hold_route_rejects_client_rpm_without_admitting_a_command(self):
         runtime = FakeRuntime(6.0)
-        status, body = self.request(runtime, "/api/manual/hold?rpm=6")
+        status, body = self.request(runtime, "/api/manual/hold?rpm=6&session=test-session")
         self.assertEqual(status, 409)
-        self.assertIn("accepterar inte RPM", body["error"])
+        self.assertIn("kräver exakt en webbsession", body["error"])
         self.assertEqual(runtime.commands, [])
+
+    def test_manual_web_session_rejects_delayed_or_duplicate_commands_after_stop(self):
+        runtime = FakeRuntime(6.0)
+        status, body = self.request(runtime, "/api/manual/session?epoch=test-epoch")
+        self.assertEqual(status, 200)
+        old = body["session"]
+        status, _body = self.request(runtime, f"/api/manual/forward?session={old}")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(runtime.commands), 1)
+
+        # This models a direction request delayed behind the explicit STOP.
+        self.assertEqual(self.request(runtime, "/api/stop")[0], 200)
+        status, body = self.request(runtime, f"/api/manual/forward?session={old}")
+        self.assertEqual(status, 409)
+        self.assertIn("utgången eller ogiltig", body["error"])
+        self.assertEqual(len(runtime.commands), 1)
+
+        # A queued pointer-down/session request bearing the pre-STOP epoch
+        # is also stale: it cannot mint a new authority after STOP.
+        status, body = self.request(runtime, "/api/manual/session?epoch=test-epoch")
+        self.assertEqual(status, 409)
+        self.assertIn("inaktuell freshness-epoch", body["error"])
+
+        status, body = self.request(runtime, f"/api/manual/session?epoch={runtime.web_epoch}")
+        self.assertEqual(status, 200)
+        fresh = body["session"]
+        self.assertNotEqual(fresh, old)
+        # A duplicate delayed old request remains rejected even after a fresh
+        # pointer-down/session, while the fresh one is admitted.
+        self.assertEqual(self.request(runtime, f"/api/manual/forward?session={old}")[0], 409)
+        self.assertEqual(self.request(runtime, f"/api/manual/forward?session={fresh}")[0], 200)
+        self.assertEqual(len(runtime.commands), 2)
 
     def test_dashboard_manual_controls_are_held_and_never_arm(self):
         from field_control.web import DASHBOARD_HTML
@@ -428,12 +468,28 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn("fetch('/api/stop',{method:'POST'})", DASHBOARD_HTML)
         self.assertIn("Manual request failed: ${error.message}; STOP sent", DASHBOARD_HTML)
         self.assertIn("/api/manual/hold", DASHBOARD_HTML)
-        self.assertIn("function releaseManual(pointerId){if(manual.active&&manual.pointerId===pointerId){manual.pointerId=null;manual.path='/api/manual/hold';sendManual();}}", DASHBOARD_HTML)
-        self.assertIn("function stopManualIfActive(){if(manual.active||manual.inFlight||manual.pointerId!==null||manual.path!==null)stopManual();}", DASHBOARD_HTML)
+        self.assertIn("function releaseManual(pointerId){if(manual.pendingStart&&manual.pendingStart.pointerId===pointerId)manual.pendingStart=null;if(manual.active&&manual.pointerId===pointerId)stopManual();}", DASHBOARD_HTML)
+        self.assertIn("function stopManualIfActive(){stopManual();}", DASHBOARD_HTML)
+        self.assertIn("if(hadSession)sendManualStop();", DASHBOARD_HTML)
+        self.assertIn("The server invalidates the session before STOP returns", DASHBOARD_HTML)
+        self.assertNotIn("manual.path='/api/manual/hold'", DASHBOARD_HTML)
         self.assertIn("window.addEventListener('blur',stopManualIfActive)", DASHBOARD_HTML)
         self.assertIn("if(document.hidden)stopManualIfActive()", DASHBOARD_HTML)
         self.assertNotIn("window.addEventListener('blur',stopManual);", DASHBOARD_HTML)
         self.assertNotIn("/api/arm-motor-output", DASHBOARD_HTML)
+
+    def test_dashboard_release_cancels_refresh_before_exactly_one_serialized_stop(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # ``stopManual`` clears the 100 ms hold timer before it can arrange
+        # STOP immediately even if a directional request is unresolved. The
+        # server-side session fence rejects that delayed direction.
+        stop = DASHBOARD_HTML[DASHBOARD_HTML.index("function stopManual()"):
+                              DASHBOARD_HTML.index("function stopManualIfActive()")]
+        self.assertIn("manual.active=false;manual.starting=false;manual.path=null;manual.pointerId=null;manual.session=null;clearManualTimer();", stop)
+        self.assertIn("if(hadSession)sendManualStop();", stop)
+        self.assertNotIn("manual.inFlight){manual.stopPending", stop)
+        self.assertNotIn("setInterval", stop)
 
     def test_dashboard_places_speed_and_manual_controls_in_requested_safe_order(self):
         from field_control.web import DASHBOARD_HTML
@@ -468,8 +524,9 @@ class ManualWebTests(unittest.TestCase):
 
         # The section renderer still iterates the complete staged profile;
         # only the already visible direct-control fields are excluded here.
-        self.assertIn("for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path))continue;", DASHBOARD_HTML)
-        self.assertIn("groups.get(configGroupForPath(path)).append(label);", DASHBOARD_HTML)
+        self.assertIn("for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path)||path==='odometry_geometry.left_wheel_circumference_m'||path==='odometry_geometry.right_wheel_circumference_m')continue;", DASHBOARD_HTML)
+        self.assertIn("const groupId=configGroupForPath(path),rows=groupId==='rows'?groups.get('rows'):null,slot=rows?rowZoneSlot(path,rows.rows):null;", DASHBOARD_HTML)
+        self.assertIn("else groups.get(groupId).append(label);", DASHBOARD_HTML)
         self.assertIn("const configGroups=[", DASHBOARD_HTML)
         for group in (
             "Radmål och zoner", "Bild, HSV och perspektiv",
@@ -488,6 +545,64 @@ class ManualWebTests(unittest.TestCase):
             self.assertIn(field, DASHBOARD_HTML)
         self.assertIn("class=\"config-sections\"", DASHBOARD_HTML)
         self.assertIn("class=\"config-profile-actions\"", DASHBOARD_HTML)
+
+    def test_dashboard_stages_one_shared_wheel_circumference_without_hiding_legacy_mismatch(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # The operator has one deliberate common value.  The underlying left
+        # and right geometry values stay distinct in the profile model, but
+        # are both written from this input as one atomic staged candidate.
+        self.assertIn("circumferenceLabel.textContent='wheel_circumference_m'", DASHBOARD_HTML)
+        self.assertIn("circumferenceInput.dataset.sharedWheelCircumference='true'", DASHBOARD_HTML)
+        self.assertIn("circumferenceInput.name='wheel_circumference_m'", DASHBOARD_HTML)
+        self.assertIn("path==='odometry_geometry.left_wheel_circumference_m'||path==='odometry_geometry.right_wheel_circumference_m'", DASHBOARD_HTML)
+        self.assertIn("const sharedWheelCircumference=document.querySelector('[data-shared-wheel-circumference]')", DASHBOARD_HTML)
+        self.assertIn("wheel_circumference_m must be a positive common value for both wheels", DASHBOARD_HTML)
+        self.assertIn("candidate.odometry_geometry.left_wheel_circumference_m=wheelCircumference", DASHBOARD_HTML)
+        self.assertIn("candidate.odometry_geometry.right_wheel_circumference_m=wheelCircumference", DASHBOARD_HTML)
+
+    def test_dashboard_requires_operator_value_when_legacy_wheel_circumferences_differ(self):
+        from field_control.web import DASHBOARD_HTML
+
+        self.assertIn("leftCircumference===rightCircumference", DASHBOARD_HTML)
+        self.assertIn("if(circumferencesMatch)circumferenceInput.value=String(leftCircumference)", DASHBOARD_HTML)
+        self.assertIn("Left and right wheel circumferences differ. Enter wheel_circumference_m", DASHBOARD_HTML)
+        # The generic per-leaf loop must not process the special input, which
+        # has no old profile path and is validated/fanned out separately.
+        self.assertIn("document.querySelectorAll('#config-fields input[data-path]')", DASHBOARD_HTML)
+
+    def test_dashboard_lays_out_row_targets_and_boundaries_in_two_columns(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # The row section has its own fixed two-column desktop grid rather
+        # than inheriting the generic three-column configuration field layout,
+        # and spans the full configuration grid so each row has usable width.
+        self.assertIn('.config-section[data-config-group="rows"]{grid-column:1/-1}', DASHBOARD_HTML)
+        self.assertIn(".row-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));", DASHBOARD_HTML)
+        self.assertIn(".row-zone-goal{display:grid;grid-template-columns:1fr;gap:5px}", DASHBOARD_HTML)
+        self.assertIn(".row-zone-goal input{width:100%", DASHBOARD_HTML)
+        self.assertIn("for(const rowTitle of ['Rad 1','Rad 2'])", DASHBOARD_HTML)
+        self.assertIn("[['navigation','navigation_boundaries'],['pick','pick_boundaries'],['trigger','trigger_boundaries']]", DASHBOARD_HTML)
+        self.assertIn("function rowZoneSlot(path,rowZones)", DASHBOARD_HTML)
+        self.assertIn("label.textContent=slot?rowZoneLabel(path):configLabel(path);", DASHBOARD_HTML)
+        self.assertIn("input.dataset.path=path;", DASHBOARD_HTML)
+        # The marker is deliberately outside the two per-row columns.
+        self.assertIn("sharedHeading.textContent='Shared turn marker zone'", DASHBOARD_HTML)
+        self.assertIn("section.append(heading,note,fields,shared)", DASHBOARD_HTML)
+
+    def test_dashboard_row_labels_preserve_bound_inputs_when_rendered(self):
+        from field_control.web import DASHBOARD_HTML
+
+        # Row labels must be assigned before the input is appended.  Assigning
+        # label.textContent afterwards clears all of its children, including
+        # the data-path-bound input, which was the regression reported here.
+        render = DASHBOARD_HTML[DASHBOARD_HTML.index("function renderConfig(candidate)"):]
+        label = render.index("label.textContent=slot?rowZoneLabel(path):configLabel(path);")
+        binding = render.index("input.dataset.path=path;")
+        append = render.index("label.append(input);")
+        self.assertLess(label, binding)
+        self.assertLess(binding, append)
+        self.assertNotIn("label.append(input);if(rows){if(slot){label.textContent", render)
 
     def test_dashboard_restart_waits_for_process_replacement_before_reload(self):
         from field_control.web import DASHBOARD_HTML
@@ -523,8 +638,8 @@ class ManualWebTests(unittest.TestCase):
         from field_control.web import DASHBOARD_HTML
 
         self.assertIn("function manualRequestPath(path)", DASHBOARD_HTML)
-        self.assertIn("if(path==='/api/manual/hold')return path", DASHBOARD_HTML)
-        self.assertIn("`${path}?rpm=${encodeURIComponent(rpm)}`", DASHBOARD_HTML)
+        self.assertIn("new URLSearchParams({session:manual.session})", DASHBOARD_HTML)
+        self.assertIn("parameters.set('rpm',rpm)", DASHBOARD_HTML)
         self.assertIn("if(!speedInitialized){rpmInput.value=String(configuredRpm);speedInitialized=true;}", DASHBOARD_HTML)
         self.assertIn("rpmInput.max=String(maxRpm)", DASHBOARD_HTML)
 
@@ -596,7 +711,7 @@ class ManualWebTests(unittest.TestCase):
         from remote_control.physical import encode_speed_command
 
         runtime = FakeRuntime(6.0)
-        self.request(runtime, "/api/manual/forward")
+        self.request(runtime, "/api/manual/forward?session=test-session")
         command = runtime.commands[-1]; profile = ControlConfig()
         left = encode_speed_command(profile.left_motor_id, command.left_rpm * profile.left_forward_sign)
         right = encode_speed_command(profile.right_motor_id, command.right_rpm * profile.right_forward_sign)
@@ -607,13 +722,13 @@ class ManualWebTests(unittest.TestCase):
 
     def test_zero_rpm_and_runtime_manual_rejections_are_conflicts_without_command(self):
         runtime = FakeRuntime(0.0)
-        status, _body = self.request(runtime, "/api/manual/forward")
+        status, _body = self.request(runtime, "/api/manual/forward?session=test-session")
         self.assertEqual(status, 409); self.assertEqual(runtime.commands, [])
         for message in ("manuellt kommando kräver MANUAL", "motorutgången är avstängd",
                         "manuell control-lease saknas", "runtime stängs"):
             with self.subTest(message=message):
                 rejected = FakeRuntime(6.0, ValueError(message))
-                status, body = self.request(rejected, "/api/manual/forward")
+                status, body = self.request(rejected, "/api/manual/forward?session=test-session")
                 self.assertEqual(status, 409); self.assertEqual(body["error"], message)
                 self.assertEqual(rejected.commands, [])
 

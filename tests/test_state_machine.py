@@ -1,6 +1,11 @@
 import unittest
 
+import cv2
+import numpy as np
+
+from field_control.config import HsvFilter, VisionConfig, Zone
 from field_control.state_machine import FieldStateMachine, Observation, SafetyConfig, State
+from field_control.vision import VisionProcessor
 
 
 def obs(now=0.0, **changes):
@@ -121,6 +126,43 @@ class FieldStateMachineTests(unittest.TestCase):
         self.assertEqual(machine.state, State.AUTO_POST_PICK)
         machine.tick(obs(5, distance_m=1.5))
         self.assertEqual(machine.state, State.AUTO_ROW_FOLLOW)
+
+    def test_row_two_bud_trigger_stops_while_row_one_remains_visual_master_after_pick(self):
+        """A trigger row and the selected navigation row are independent."""
+        red = HsvFilter((0, 200, 200), (5, 255, 255), 4)
+        green = HsvFilter((55, 200, 200), (65, 255, 255), 4)
+        cfg = VisionConfig(
+            navigation_mode="buds_and_leaves", buds=red, leaves=green,
+            navigation_zone=Zone(0, .45, 0, 1), navigation_zone_2=Zone(.55, 1, 0, 1),
+            trigger_zone=Zone(0, .05, .5, 1), trigger_zone_2=Zone(.55, 1, .5, 1),
+            pick_zone=Zone(0, .05, .5, 1), pick_zone_2=Zone(.55, 1, .5, 1),
+        )
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        frame[10:14, 2:6] = (60, 255, 255)   # row-1 leaf: visual master
+        frame[10:14, 15:19] = (0, 255, 255)  # row-2 bud: trigger and pick
+        result = VisionProcessor().process(cv2.cvtColor(frame, cv2.COLOR_HSV2BGR), 1, cfg)
+        self.assertEqual(result.master_row, 1)
+        self.assertTrue(result.bud_in_trigger_zone)
+        self.assertTrue(result.bud_in_pick_zone)
+
+        machine = self.started(SafetyConfig(auto_start_delay_s=0, pick_clear_time_s=1,
+                                             post_pick_lockout_distance_m=.5))
+        machine.tick(obs(1, visual_target=result.target_x is not None,
+                         bud_in_trigger_zone=result.bud_in_trigger_zone,
+                         bud_in_pick_zone=result.bud_in_pick_zone, distance_m=1))
+        self.assertEqual(machine.state, State.AUTO_PICK)
+
+        # The bud is harvested/cleared, but row 1 continues to provide the
+        # master target.  A renewed row-2 trigger cannot interrupt lockout.
+        machine.tick(obs(2, visual_target=True, bud_in_pick_zone=False, distance_m=1))
+        machine.tick(obs(3.1, visual_target=True, bud_in_pick_zone=False, distance_m=1))
+        self.assertEqual(machine.state, State.AUTO_POST_PICK)
+        machine.tick(obs(4, visual_target=True, bud_in_trigger_zone=True, distance_m=1.49))
+        self.assertEqual(machine.state, State.AUTO_POST_PICK)
+        machine.tick(obs(5, visual_target=True, bud_in_trigger_zone=True, distance_m=1.5))
+        self.assertEqual(machine.state, State.AUTO_ROW_FOLLOW)
+        machine.tick(obs(6, visual_target=True, bud_in_trigger_zone=True, distance_m=1.51))
+        self.assertEqual(machine.state, State.AUTO_PICK)
 
     def test_post_pick_lockout_exits_to_search_without_visual_target(self):
         machine = self.started(SafetyConfig(auto_start_delay_s=0, pick_clear_time_s=1,
