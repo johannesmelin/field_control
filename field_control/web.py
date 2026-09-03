@@ -160,25 +160,9 @@ class DiagnosticsServer:
                 if path == "/api/application/restart":
                     if request.query:
                         self._conflict("programomstart accepterar inga parametrar"); return
-                    # This deliberately bypasses profile parsing and the
-                    # configuration-restart reservation.  The CLI owns the
-                    # following close/STOP attempts and process replacement;
-                    # write the response first so a slow close cannot make
-                    # the browser mistake an accepted restart for failure.
-                    self._json({"restarting": True})
-                    fence = getattr(runtime, "begin_application_restart", None)
-                    # The fence is deliberately best-effort from HTTP's
-                    # perspective: it latches any STOP failure itself, and
-                    # an accepted process restart must still reach the CLI's
-                    # close/exec owner.
-                    event = getattr(owner, "_restart_requested", None)
-                    try:
-                        if callable(fence): fence()
-                    finally:
-                        if event is not None: event.set()
+                    self._accept_application_restart({"restarting": True})
                     return
                 if path in ("/api/config/save", "/api/config/select", "/api/config/restart"):
-                    restart_reserved = False
                     try:
                         value = self._json_body()
                         if path == "/api/config/save":
@@ -197,23 +181,22 @@ class DiagnosticsServer:
                             candidate = value["candidate"]
                             if not isinstance(candidate, dict): raise ValueError("candidate måste vara ett objekt")
                             if "physical_can" in candidate: raise ValueError("physical_can får inte sparas")
-                            # All candidate parsing and strict cross-field
-                            # validation completes before the reservation. A
-                            # slow, malformed, or invalid client request can
-                            # therefore never block local motor authority.
+                            # Strict parsing and both atomic persistence
+                            # operations complete before this restart can be
+                            # accepted.  A malformed candidate can therefore
+                            # neither alter runtime authority nor strand a
+                            # partially selected process restart.
                             merged = asdict(runtime.config); merged.update(candidate)
                             config = runtime_config_from_dict(merged)
-                            reserve = getattr(runtime, "reserve_configuration_restart", None)
-                            restart_reserved = bool(reserve()) if callable(reserve) else False
-                            if not restart_reserved:
-                                raise ValueError("konfigurationsomstart kunde inte nå verifierat stopp")
                             name = save_profile(config, profiles_dir)
                             select_profile(name, profiles_dir)
-                            # Send the complete response before signaling the
-                            # CLI loop to perform its clean disarmed restart.
-                            self._json({"selected": name, "restarting": True})
-                            event = getattr(owner, "_restart_requested", None)
-                            if event is not None: event.set()
+                            # Config restart is intentionally the same
+                            # process-replacement path as a plain application
+                            # restart.  It must work from ARMED, AUTO or FAULT
+                            # because the fresh process clears transient
+                            # runtime state and independently executes its
+                            # normal bounded close/arm behavior.
+                            self._accept_application_restart({"selected": name, "restarting": True})
                             return
                         if set(value) != {"name"} or not isinstance(value["name"], str):
                             raise ValueError("select kräver exakt filnamn")
@@ -222,9 +205,6 @@ class DiagnosticsServer:
                         select_profile(value["name"], profiles_dir)
                         self._json({"selected": value["name"], "apply_on_restart": True}); return
                     except (OSError, ValueError) as exc:
-                        if restart_reserved:
-                            cancel = getattr(runtime, "cancel_configuration_restart", None)
-                            if callable(cancel): cancel()
                         self._conflict(str(exc)); return
                 manual_directions = {
                     # WheelCommand is logical vehicle direction. The verified
@@ -307,6 +287,32 @@ class DiagnosticsServer:
                 body = json.dumps(value, ensure_ascii=True).encode()
                 self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def _accept_application_restart(self, value: object) -> None:
+                """Fence, acknowledge, then hand process replacement to CLI.
+
+                The admission fence is instantaneous and happens first.  The
+                positive HTTP response is flushed before bounded STOP work and
+                before the CLI event, which prevents a browser from treating
+                an accepted restart as a transport failure when the old server
+                disappears quickly.
+                """
+                fence = getattr(runtime, "fence_application_restart", None)
+                fenced = bool(fence()) if callable(fence) else True
+                self._json(value)
+                self.wfile.flush()
+                event = getattr(owner, "_restart_requested", None)
+                try:
+                    complete = getattr(runtime, "complete_application_restart", None)
+                    if fenced and callable(complete):
+                        complete()
+                    elif fenced:
+                        # Compatibility with narrowly mocked/older runtime
+                        # seams: production always exposes the two-stage API.
+                        begin = getattr(runtime, "begin_application_restart", None)
+                        if callable(begin): begin()
+                finally:
+                    if event is not None: event.set()
 
             def _json_body(self) -> dict[str, object]:
                 length = self.headers.get("Content-Length")
@@ -425,7 +431,7 @@ rpmInput.insertAdjacentHTML('afterend','<label class="label" for="auto-rpm">Auto
 const stagedSpeedRow=document.createElement('div'),manualSpeedLabel=document.querySelector('label[for="rpm"]');stagedSpeedRow.className='staged-speed-row';rpmInput.parentNode.insertBefore(stagedSpeedRow,manualSpeedLabel);for(const [heading,id] of [['Manual','rpm'],['Auto','auto-rpm'],['Turn','turn-rpm']]){const input=document.getElementById(id),label=document.querySelector(`label[for="${id}"]`),cell=document.createElement('div');cell.innerHTML=`<h3>${heading}</h3>`;cell.append(label,input);if(id==='turn-rpm'){const timeout=document.getElementById('turn-timeout'),timeoutLabel=document.querySelector('label[for="turn-timeout"]');cell.append(timeoutLabel,timeout);}stagedSpeedRow.append(cell);}
 document.head.insertAdjacentHTML('beforeend','<style>.staged-speed-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:8px 0}.staged-speed-row h3{margin:0 0 2px;font-size:12px;color:#173d3a}.staged-speed-row label{font-size:10px}.staged-speed-row .speed-input{margin:2px 0 5px}@media(max-width:760px){.staged-speed-row{grid-template-columns:1fr}}</style>');
 document.head.insertAdjacentHTML('beforeend','<style>.compact-status{padding:9px 12px}.compact-status h2{display:inline;margin:0 10px 0 0;font-size:13px}.compact-status h3{display:inline;margin:0 5px 0 10px;font-size:10px}.compact-status .grid{display:inline-grid;grid-template-columns:repeat(5,minmax(62px,1fr));gap:3px;vertical-align:middle}.compact-status .metric{display:inline-block;border:0;padding:0 4px}.compact-status .label{font-size:8px}.compact-status .value{font-size:11px}.compact-status .fault{display:inline;margin:0 4px;font-size:9px;min-height:0}@media(max-width:1180px){.compact-status h3{display:block;margin:7px 0 2px}.compact-status .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}}</style>');
-document.head.insertAdjacentHTML('beforeend','<style>.config-section[data-config-group="rows"]{grid-column:1/-1}.row-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.row-zone-column{border:1px solid #dce5e7;border-radius:5px;padding:8px;background:#fff;min-width:0}.row-zone-column h4{margin:0 0 6px;color:#173d3a;font-size:12px}.row-zone-goal{display:grid;grid-template-columns:1fr;gap:5px}.row-zone-goal label{display:block;font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-goal input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.row-zone-group{border-top:1px solid #e5eaeb;margin-top:7px;padding-top:6px}.row-zone-group h5,.shared-turn-marker h4{margin:0 0 3px;color:#65727b;font-size:10px}.row-zone-inputs,.shared-turn-marker .config-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}.row-zone-inputs label,.shared-turn-marker label{font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-inputs input,.shared-turn-marker input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.shared-turn-marker{border-top:1px solid #dce5e7;margin-top:10px;padding-top:8px}.config-validation-warning{grid-column:1/-1;margin:0;color:var(--accent);font-size:11px;font-weight:700}@media(max-width:760px){.row-zone-grid{grid-template-columns:1fr}}</style>');
+document.head.insertAdjacentHTML('beforeend','<style>.config-section[data-config-group="rows"]{grid-column:1/-1}.row-camera-serial{display:block;max-width:360px;margin:0 0 10px;font-size:10px;color:var(--muted)}.row-camera-serial input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.row-zone-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.row-zone-column{border:1px solid #dce5e7;border-radius:5px;padding:8px;background:#fff;min-width:0}.row-zone-column h4{margin:0 0 6px;color:#173d3a;font-size:12px}.row-zone-goal{display:grid;grid-template-columns:1fr;gap:5px}.row-zone-goal label{display:block;font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-goal input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.row-zone-goal label.row-enabled{display:flex;align-items:center;gap:5px}.row-zone-goal label.row-enabled input{width:auto;margin:0}.row-zone-group{border-top:1px solid #e5eaeb;margin-top:7px;padding-top:6px}.row-zone-group h5,.shared-turn-marker h4{margin:0 0 3px;color:#65727b;font-size:10px}.row-zone-inputs,.shared-turn-marker .config-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}.row-zone-inputs label,.shared-turn-marker label{font-size:10px;color:var(--muted);overflow-wrap:anywhere}.row-zone-inputs input,.shared-turn-marker input{width:100%;margin:2px 0;padding:5px;border:1px solid var(--line);border-radius:5px;font-size:12px}.shared-turn-marker{border-top:1px solid #dce5e7;margin-top:10px;padding-top:8px}.config-validation-warning{grid-column:1/-1;margin:0;color:var(--accent);font-size:11px;font-weight:700}@media(max-width:1180px){.row-zone-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.row-zone-grid{grid-template-columns:1fr}}</style>');
 // Compact controls are shared by both tabs.  The old selector made ``main``
 // itself a desktop grid and positioned direct children, which is invalid once
 // the panels are deliberately moved below their tab panes.
@@ -440,7 +446,7 @@ function atPath(value,path){return path.split('.').reduce((v,k)=>v?.[k],value)}
 function setPath(value,path,next){const keys=path.split('.');let target=value;for(const key of keys.slice(0,-1))target=target[key];target[keys.at(-1)]=next;}
 function leafEntries(value,prefix=''){if(Array.isArray(value))return [[prefix,value.join(',')]];if(value&&typeof value==='object')return Object.entries(value).flatMap(([key,item])=>leafEntries(item,prefix?`${prefix}.${key}`:key));return [[prefix,value]];}
 function isRpmPath(path){return path.endsWith('_rpm');}
-function configLabel(path){const match=path.match(/^vision\\.(navigation|trigger|pick)_zone(_2)?\\.x_distance$/);if(match)return `${match[1]}${match[2]?' 2':' 1'} x distance from x goal`;if(path==='vision.x_goal')return 'x_goal_1';if(path==='vision.x_goal_2')return 'x_goal_2';return isRpmPath(path)?`${path} (wheel RPM)`:path;}
+function configLabel(path){const match=path.match(/^vision\\.(navigation|trigger|pick)_zone(_2)?\\.x_distance$/);if(match)return `${match[1]}${match[2]?' 2':' 1'} x distance from x goal`;if(path==='vision.x_goal')return 'x_goal_1';if(path==='vision.x_goal_2')return 'x_goal_2';if(path==='vision.camera_serial_number')return 'Camera serial number';if(path==='vision.row_1_enabled'||path==='vision.row_2_enabled')return 'Enabled';return isRpmPath(path)?`${path} (wheel RPM)`:path;}
 const configGroups=[
   ['rows','Radmål och zoner','x-goal samt navigations-, trigger- och pick-zoner för båda raderna.'],
   ['vision','Bild, HSV och perspektiv','Bildutsnitt, markbredd, HSV-filter och detektion.'],
@@ -451,7 +457,7 @@ const configGroups=[
   ['general','Allmänt och gränser','Övriga driftparametrar och hastighetsgränser.'],
 ];
 function configGroupForPath(path){
-  if(/^vision\\.(x_goal(?:_2)?|navigation_zone(?:_2)?|trigger_zone(?:_2)?|pick_zone(?:_2)?|turn_marker_zone)/.test(path))return 'rows';
+  if(/^vision\\.(camera_serial_number|row_[12]_enabled|x_goal(?:_2)?|navigation_zone(?:_2)?|trigger_zone(?:_2)?|pick_zone(?:_2)?|turn_marker_zone)/.test(path))return 'rows';
   if(/^vision\\.(buds|leaves|marker|first_crop|x_goal_top|ground_width_)/.test(path))return 'vision';
   if(/^(vision\\.(x_filter|x_outlier)|vision_(kp|deadband_px)|max_vision_correction_rpm|heading_|imu_|row_heading_window_m|heading_reference_min_distance_m|search_speed_rpm)/.test(path))return 'navigation';
   if(/^(safety\\.|row_spacing_m)/.test(path))return 'harvest';
@@ -460,9 +466,9 @@ function configGroupForPath(path){
   return 'general';
 }
 function migrateCentredLegacyZones(candidate){const next=structuredClone(candidate),vision=next.vision,goal=Number(vision?.x_goal);if(!Number.isFinite(goal))return next;for(const name of ['navigation','trigger','pick']){const key=`${name}_zone`,zone=vision[key];if(!zone||typeof zone!=='object'||'x_distance'in zone||!['x_min','x_max','y_min','y_max'].every(field=>typeof zone[field]==='number'))continue;const midpoint=(zone.x_min+zone.x_max)/2;if(Math.abs(midpoint-goal)>goalRelativeZoneMigrationTolerance)continue;vision[key]={x_distance:(zone.x_max-zone.x_min)/2,y_min:zone.y_min,y_max:zone.y_max};}return next;}
-function rowZoneSlot(path,rowZones){const goal=path.match(/^vision\\.x_goal(_2)?$/);if(goal)return rowZones[goal[1]?1:0].goal;const zone=path.match(/^vision\\.(navigation|pick|trigger)_zone(_2)?\\.(.+)$/);if(!zone)return null;return rowZones[zone[2]?1:0].zones[zone[1]];}
-function rowZoneLabel(path){const leaf=path.split('.').at(-1);return leaf==='x_goal'?'x_goal_1':leaf==='x_goal_2'?'x_goal_2':leaf;}
-function renderConfig(candidate){candidate=migrateCentredLegacyZones(candidate);profileCandidate=candidate;const ratio=Number(candidate.odometry_geometry?.motor_turns_per_wheel_turn);gearRatio=Number.isFinite(ratio)&&ratio>0?ratio:null;document.querySelectorAll('[data-direct]').forEach(el=>{const value=atPath(candidate,el.dataset.direct);if(el.type==='checkbox')el.checked=Boolean(value);else el.value=value??'';});const root=document.getElementById('config-fields');root.textContent='';const groups=new Map(configGroups.map(([id,title,description])=>{const section=document.createElement('section'),heading=document.createElement('h3'),note=document.createElement('p'),fields=document.createElement('div');section.className='config-section';section.dataset.configGroup=id;heading.textContent=title;note.textContent=description;if(id==='rows'){const rows=[];fields.className='row-zone-grid';for(const rowTitle of ['Rad 1','Rad 2']){const column=document.createElement('section'),columnHeading=document.createElement('h4'),goal=document.createElement('div'),zones={};column.className='row-zone-column';columnHeading.textContent=rowTitle;goal.className='row-zone-goal';column.append(columnHeading,goal);for(const [zoneName,zoneTitle] of [['navigation','navigation_boundaries'],['pick','pick_boundaries'],['trigger','trigger_boundaries']]){const zone=document.createElement('section'),zoneHeading=document.createElement('h5'),inputs=document.createElement('div');zone.className='row-zone-group';zoneHeading.textContent=zoneTitle;inputs.className='row-zone-inputs';zone.append(zoneHeading,inputs);column.append(zone);zones[zoneName]=inputs;}fields.append(column);rows.push({goal,zones});}const shared=document.createElement('section'),sharedHeading=document.createElement('h4'),sharedFields=document.createElement('div');shared.className='shared-turn-marker';sharedHeading.textContent='Shared turn marker zone';sharedFields.className='config-fields';shared.append(sharedHeading,sharedFields);section.append(heading,note,fields,shared);root.append(section);return [id,{rows,shared:sharedFields}];}fields.className='config-fields';section.append(heading,note,fields);root.append(section);return [id,fields];}));const leftCircumference=Number(candidate.odometry_geometry?.left_wheel_circumference_m),rightCircumference=Number(candidate.odometry_geometry?.right_wheel_circumference_m),circumferencesMatch=Number.isFinite(leftCircumference)&&leftCircumference>0&&leftCircumference===rightCircumference;const circumferenceLabel=document.createElement('label'),circumferenceInput=document.createElement('input');circumferenceLabel.textContent='wheel_circumference_m';circumferenceInput.dataset.sharedWheelCircumference='true';circumferenceInput.name='wheel_circumference_m';circumferenceInput.type='number';circumferenceInput.min='0';circumferenceInput.step='any';if(circumferencesMatch)circumferenceInput.value=String(leftCircumference);else{circumferenceInput.placeholder='Set a common positive value';circumferenceLabel.title='Left and right wheel circumferences differ. Enter one common value before saving.';}circumferenceLabel.append(circumferenceInput);const odometryFields=groups.get('odometry');odometryFields.append(circumferenceLabel);if(!circumferencesMatch){const warning=document.createElement('p');warning.className='config-validation-warning';warning.textContent='Left and right wheel circumferences differ. Enter wheel_circumference_m to use one common value before saving.';odometryFields.append(warning);}for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path)||path==='odometry_geometry.left_wheel_circumference_m'||path==='odometry_geometry.right_wheel_circumference_m')continue;const groupId=configGroupForPath(path),rows=groupId==='rows'?groups.get('rows'):null,slot=rows?rowZoneSlot(path,rows.rows):null;const label=document.createElement('label');label.textContent=slot?rowZoneLabel(path):configLabel(path);const input=document.createElement('input');input.dataset.path=path;input.value=value===null?'':String(isRpmPath(path)?Number(value)/gearRatio:value);input.type=typeof value==='boolean'?'checkbox':'text';if(input.type==='checkbox')input.checked=value;label.append(input);if(rows){if(slot)slot.append(label);else rows.shared.append(label);}else groups.get(groupId).append(label);}if(manualSpeedStatus)configureManualSpeed(manualSpeedStatus);}
+function rowZoneSlot(path,rowZones){const enabled=path.match(/^vision\\.row_([12])_enabled$/);if(enabled)return rowZones[Number(enabled[1])-1].goal;const goal=path.match(/^vision\\.x_goal(_2)?$/);if(goal)return rowZones[goal[1]?1:0].goal;const zone=path.match(/^vision\\.(navigation|pick|trigger)_zone(_2)?\\.(.+)$/);if(!zone)return null;return rowZones[zone[2]?1:0].zones[zone[1]];}
+function rowZoneLabel(path){const leaf=path.split('.').at(-1);return leaf==='x_goal'?'x_goal_1':leaf==='x_goal_2'?'x_goal_2':leaf.endsWith('_enabled')?'Enabled':leaf;}
+function renderConfig(candidate){candidate=migrateCentredLegacyZones(candidate);profileCandidate=candidate;const ratio=Number(candidate.odometry_geometry?.motor_turns_per_wheel_turn);gearRatio=Number.isFinite(ratio)&&ratio>0?ratio:null;document.querySelectorAll('[data-direct]').forEach(el=>{const value=atPath(candidate,el.dataset.direct);if(el.type==='checkbox')el.checked=Boolean(value);else el.value=value??'';});const root=document.getElementById('config-fields');root.textContent='';const groups=new Map(configGroups.map(([id,title,description])=>{const section=document.createElement('section'),heading=document.createElement('h3'),note=document.createElement('p'),fields=document.createElement('div');section.className='config-section';section.dataset.configGroup=id;heading.textContent=title;note.textContent=description;if(id==='rows'){const rows=[],camera=document.createElement('div');camera.className='row-camera-serial';fields.className='row-zone-grid';for(const rowTitle of ['Rad 1','Rad 2']){const column=document.createElement('section'),columnHeading=document.createElement('h4'),goal=document.createElement('div'),zones={};column.className='row-zone-column';columnHeading.textContent=rowTitle;goal.className='row-zone-goal';column.append(columnHeading,goal);for(const [zoneName,zoneTitle] of [['navigation','navigation_boundaries'],['pick','pick_boundaries'],['trigger','trigger_boundaries']]){const zone=document.createElement('section'),zoneHeading=document.createElement('h5'),inputs=document.createElement('div');zone.className='row-zone-group';zoneHeading.textContent=zoneTitle;inputs.className='row-zone-inputs';zone.append(zoneHeading,inputs);column.append(zone);zones[zoneName]=inputs;}fields.append(column);rows.push({goal,zones});}const shared=document.createElement('section'),sharedHeading=document.createElement('h4'),sharedFields=document.createElement('div');shared.className='shared-turn-marker';sharedHeading.textContent='Shared turn marker zone';sharedFields.className='config-fields';shared.append(sharedHeading,sharedFields);section.append(heading,note,camera,fields,shared);root.append(section);return [id,{rows,camera,shared:sharedFields}];}fields.className='config-fields';section.append(heading,note,fields);root.append(section);return [id,fields];}));const leftCircumference=Number(candidate.odometry_geometry?.left_wheel_circumference_m),rightCircumference=Number(candidate.odometry_geometry?.right_wheel_circumference_m),circumferencesMatch=Number.isFinite(leftCircumference)&&leftCircumference>0&&leftCircumference===rightCircumference;const circumferenceLabel=document.createElement('label'),circumferenceInput=document.createElement('input');circumferenceLabel.textContent='wheel_circumference_m';circumferenceInput.dataset.sharedWheelCircumference='true';circumferenceInput.name='wheel_circumference_m';circumferenceInput.type='number';circumferenceInput.min='0';circumferenceInput.step='any';if(circumferencesMatch)circumferenceInput.value=String(leftCircumference);else{circumferenceInput.placeholder='Set a common positive value';circumferenceLabel.title='Left and right wheel circumferences differ. Enter one common value before saving.';}circumferenceLabel.append(circumferenceInput);const odometryFields=groups.get('odometry');odometryFields.append(circumferenceLabel);if(!circumferencesMatch){const warning=document.createElement('p');warning.className='config-validation-warning';warning.textContent='Left and right wheel circumferences differ. Enter wheel_circumference_m to use one common value before saving.';odometryFields.append(warning);}for(const [path,value] of leafEntries(candidate)){if(directPaths.includes(path)||path==='odometry_geometry.left_wheel_circumference_m'||path==='odometry_geometry.right_wheel_circumference_m')continue;const groupId=configGroupForPath(path),rows=groupId==='rows'?groups.get('rows'):null,slot=rows?rowZoneSlot(path,rows.rows):null;const label=document.createElement('label');label.textContent=slot?rowZoneLabel(path):configLabel(path);const input=document.createElement('input');input.dataset.path=path;input.value=value===null?'':String(isRpmPath(path)?Number(value)/gearRatio:value);input.type=typeof value==='boolean'?'checkbox':'text';if(input.type==='checkbox')input.checked=value;if(path==='vision.row_1_enabled'||path==='vision.row_2_enabled')label.classList.add('row-enabled');label.append(input);if(rows){if(path==='vision.camera_serial_number')rows.camera.append(label);else if(slot)slot.append(label);else rows.shared.append(label);}else groups.get(groupId).append(label);}if(manualSpeedStatus)configureManualSpeed(manualSpeedStatus);}
 function candidateFromForm(){const candidate=structuredClone(profileCandidate);document.querySelectorAll('[data-direct]').forEach(el=>setPath(candidate,el.dataset.direct,el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value)));document.querySelectorAll('#config-fields input[data-path]').forEach(el=>{const old=atPath(candidate,el.dataset.path);let value=el.type==='checkbox'?el.checked:el.value;if(Array.isArray(old))value=value.split(',').map(Number);else if(typeof old==='number')value=Number(value);else if(old===null&&value==='')value=null;if(isRpmPath(el.dataset.path))value*=gearRatio;setPath(candidate,el.dataset.path,value);});const sharedWheelCircumference=document.querySelector('[data-shared-wheel-circumference]'),wheelCircumference=Number(sharedWheelCircumference?.value);if(!Number.isFinite(wheelCircumference)||wheelCircumference<=0)throw new Error('wheel_circumference_m must be a positive common value for both wheels');candidate.odometry_geometry.left_wheel_circumference_m=wheelCircumference;candidate.odometry_geometry.right_wheel_circumference_m=wheelCircumference;return candidate;}
 const candidateFromFormBase=candidateFromForm;
 candidateFromForm=()=>{const candidate=candidateFromFormBase();document.querySelectorAll('[data-staged-rpm]').forEach(el=>{const wheelRpm=Number(el.value);if(!Number.isFinite(wheelRpm)||wheelRpm<=0)throw new Error('Staged wheel RPM must be positive');candidate[el.dataset.stagedRpm]=wheelRpm*gearRatio;});document.querySelectorAll('[data-staged-value]').forEach(el=>{const value=Number(el.value);if(!Number.isFinite(value)||value<=0)throw new Error('Staged value must be positive');setPath(candidate,el.dataset.stagedValue,value);});return candidate;};
@@ -486,7 +492,12 @@ async function reconnectAfterRestart(previousInstanceId){
     const status=await restartStatus();
     if(!status){text('config-note','Restarting: waiting for the new application…');}
     else if(status.instance_id!==previousInstanceId){
-      window.location.reload();
+      // A normal reload can reuse a stale VS Code SSH-forwarded document.
+      // Navigate to a unique URL only after a distinct server process proves
+      // it is serving the port, so HTML and inline dashboard code are fresh.
+      const fresh=new URL(window.location.href);
+      fresh.searchParams.set('restart_instance',status.instance_id);
+      window.location.replace(fresh.toString());
       return;
     }
     await pause(restartProbeDelayMs);

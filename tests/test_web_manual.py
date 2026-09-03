@@ -185,19 +185,22 @@ class ManualWebTests(unittest.TestCase):
         self.assertEqual(runtime.application_restart_calls, 1)
         self.assertTrue(server._restart_requested.is_set())
 
-    def test_configuration_restart_rejects_armed_or_leased_runtime(self):
-        runtime = FakeRuntime(); runtime.config = RuntimeConfig()
-        runtime.status = lambda: SimpleNamespace(mode="MANUAL", motor_output_armed=True)
-        runtime.lease = SimpleNamespace(valid=lambda _now: False)
-        with tempfile.TemporaryDirectory() as tmp:
-            server = object.__new__(DiagnosticsServer); server.runtime = runtime; server.profiles_dir = Path(tmp)
-            server._restart_requested = threading.Event()
-            handler = object.__new__(server._handler()); response = []; handler.path = "/api/config/restart"
-            body = b'{"candidate":{}}'; handler.rfile = io.BytesIO(body)
-            handler.headers = {"Content-Length": str(len(body)), "Content-Type": "application/json"}; handler.wfile = io.BytesIO()
-            handler.send_response = lambda status, *_args: response.append(status); handler.send_header = lambda *_args: None
-            handler.end_headers = lambda: None; handler.do_POST()
-            self.assertEqual(response, [409]); self.assertFalse(server._restart_requested.is_set())
+    def test_configuration_restart_accepts_armed_or_faulted_runtime_after_persisting_candidate(self):
+        for mode, armed in (("MANUAL", True), ("FAULT", False)):
+            with self.subTest(mode=mode):
+                runtime = FakeRuntime(); runtime.config = RuntimeConfig()
+                runtime.status = lambda: SimpleNamespace(mode=mode, motor_output_armed=armed)
+                runtime.lease = SimpleNamespace(valid=lambda _now: False)
+                with tempfile.TemporaryDirectory() as tmp:
+                    server = object.__new__(DiagnosticsServer); server.runtime = runtime; server.profiles_dir = Path(tmp)
+                    server._restart_requested = threading.Event()
+                    handler = object.__new__(server._handler()); response = []; handler.path = "/api/config/restart"
+                    body = b'{"candidate":{}}'; handler.rfile = io.BytesIO(body)
+                    handler.headers = {"Content-Length": str(len(body)), "Content-Type": "application/json"}; handler.wfile = io.BytesIO()
+                    handler.send_response = lambda status, *_args: response.append(status); handler.send_header = lambda *_args: None
+                    handler.end_headers = lambda: None; handler.do_POST()
+                    self.assertEqual(response, [200]); self.assertTrue(server._restart_requested.is_set())
+                    self.assertEqual(runtime.application_restart_calls, 1)
 
     def test_rejected_configuration_restart_releases_its_reservation(self):
         runtime = FakeRuntime(); runtime.config = RuntimeConfig()
@@ -574,11 +577,13 @@ class ManualWebTests(unittest.TestCase):
     def test_dashboard_lays_out_row_targets_and_boundaries_in_two_columns(self):
         from field_control.web import DASHBOARD_HTML
 
-        # The row section has its own fixed two-column desktop grid rather
-        # than inheriting the generic three-column configuration field layout,
-        # and spans the full configuration grid so each row has usable width.
+        # The row section spans the configuration grid, while its four-column
+        # desktop layout makes each row panel one quarter page-width.  It
+        # retains two and one-column responsive layouts at narrower widths.
         self.assertIn('.config-section[data-config-group="rows"]{grid-column:1/-1}', DASHBOARD_HTML)
-        self.assertIn(".row-zone-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));", DASHBOARD_HTML)
+        self.assertIn(".row-zone-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));", DASHBOARD_HTML)
+        self.assertIn("@media(max-width:1180px){.row-zone-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}", DASHBOARD_HTML)
+        self.assertIn("@media(max-width:760px){.row-zone-grid{grid-template-columns:1fr}}", DASHBOARD_HTML)
         self.assertIn(".row-zone-goal{display:grid;grid-template-columns:1fr;gap:5px}", DASHBOARD_HTML)
         self.assertIn(".row-zone-goal input{width:100%", DASHBOARD_HTML)
         self.assertIn("for(const rowTitle of ['Rad 1','Rad 2'])", DASHBOARD_HTML)
@@ -588,7 +593,12 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn("input.dataset.path=path;", DASHBOARD_HTML)
         # The marker is deliberately outside the two per-row columns.
         self.assertIn("sharedHeading.textContent='Shared turn marker zone'", DASHBOARD_HTML)
-        self.assertIn("section.append(heading,note,fields,shared)", DASHBOARD_HTML)
+        self.assertIn("camera.className='row-camera-serial'", DASHBOARD_HTML)
+        self.assertIn("section.append(heading,note,camera,fields,shared)", DASHBOARD_HTML)
+        self.assertIn("if(path==='vision.camera_serial_number')rows.camera.append(label)", DASHBOARD_HTML)
+        self.assertIn("if(path==='vision.row_1_enabled'||path==='vision.row_2_enabled')label.classList.add('row-enabled')", DASHBOARD_HTML)
+        self.assertIn("function rowZoneSlot(path,rowZones){const enabled=path.match(", DASHBOARD_HTML)
+        self.assertIn("row_([12])_enabled", DASHBOARD_HTML)
 
     def test_dashboard_row_labels_preserve_bound_inputs_when_rendered(self):
         from field_control.web import DASHBOARD_HTML
@@ -604,12 +614,14 @@ class ManualWebTests(unittest.TestCase):
         self.assertLess(binding, append)
         self.assertNotIn("label.append(input);if(rows){if(slot){label.textContent", render)
 
-    def test_dashboard_restart_waits_for_process_replacement_before_reload(self):
+    def test_dashboard_restart_waits_for_process_replacement_before_fresh_navigation(self):
         from field_control.web import DASHBOARD_HTML
         self.assertIn("const restartProbeDelayMs=250, restartProbeTimeoutMs=1000, restartReconnectDeadlineMs=90000;", DASHBOARD_HTML)
         self.assertIn("const controller=new AbortController();", DASHBOARD_HTML)
         self.assertIn("let speedInitialized=false, profileCandidate=null, gearRatio=null, manualSpeedStatus=null, dashboardInstanceId=null;", DASHBOARD_HTML)
-        self.assertIn("else if(status.instance_id!==previousInstanceId){\n      window.location.reload();", DASHBOARD_HTML)
+        self.assertIn("fresh.searchParams.set('restart_instance',status.instance_id);", DASHBOARD_HTML)
+        self.assertIn("window.location.replace(fresh.toString());", DASHBOARD_HTML)
+        self.assertNotIn("window.location.reload();", DASHBOARD_HTML)
         self.assertIn("const previousStatus=dashboardInstanceId?{instance_id:dashboardInstanceId}:await restartStatus();", DASHBOARD_HTML)
         self.assertIn("Restarting with ${data.selected}; reconnecting automatically", DASHBOARD_HTML)
 

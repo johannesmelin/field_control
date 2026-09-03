@@ -103,6 +103,10 @@ def _vision(value: Any) -> VisionConfig:
             kwargs[field.name] = getattr(defaults, field.name) if field.name not in data else _first_crop(item, path)
         elif field.name == "navigation_mode":
             kwargs[field.name] = _string(item, path)
+        elif field.name == "camera_serial_number":
+            kwargs[field.name] = _string(item, path)
+        elif field.name in ("row_1_enabled", "row_2_enabled"):
+            kwargs[field.name] = _boolean(item, path)
         elif field.name == "x_filter_window_frames":
             kwargs[field.name] = _integer(item, path)
         elif field.name == "x_outlier_threshold_px":

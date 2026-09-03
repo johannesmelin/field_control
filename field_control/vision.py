@@ -117,6 +117,12 @@ class VisionProcessor:
         marker, marker_parts = self._components(marker, config.marker.min_area)
         def target_for(row: int, bud_parts: list[tuple[float, float, float]],
                        leaf_parts: list[tuple[float, float, float]]) -> tuple[float | None, float | None]:
+            if not (config.row_1_enabled if row == 1 else config.row_2_enabled):
+                # Never retain stale measurements while an operator has
+                # disabled this row.  Re-enabling it must acquire a fresh
+                # visual target rather than revive an old filtered target.
+                self._history[row].clear()
+                return None, None
             parts_for_target = [bud_parts]
             if config.navigation_mode == "buds_and_leaves":
                 parts_for_target.append(leaf_parts)

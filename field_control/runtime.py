@@ -884,19 +884,28 @@ class FieldControlRuntime:
                 self.machine.stop("Konfigurationsomstart")
             return True
 
-    def begin_application_restart(self) -> None:
-        """Fence authority and queue zero output before process replacement.
+    def fence_application_restart(self) -> bool:
+        """Atomically reject new output authority for a pending restart.
 
-        Unlike configuration restart this never waits for a verified settle
-        and never decides whether the CLI may restart.  A close/settle error
-        is recorded fail-closed, while the owner still receives the restart
-        event and the replacement independently verifies its own arm STOP.
+        This deliberately contains no potentially slow motor operation.  The
+        HTTP boundary can therefore publish an accepted restart response only
+        after no later manual/AUTO/A2 admission can win the handoff race.
+        ``complete_application_restart`` performs the bounded STOP path
+        before the CLI is told to replace this process.
         """
         with self._lifecycle_lock:
             with self._lock:
                 if self._application_restart_pending:
-                    return
+                    return False
                 self._application_restart_pending = True
+        return True
+
+    def complete_application_restart(self) -> None:
+        """Perform bounded restart cleanup after authority is fenced."""
+        with self._lifecycle_lock:
+            with self._lock:
+                if not self._application_restart_pending:
+                    raise RuntimeError("programomstart saknar fence")
             self._cancel_pending_auto_start()
             self._clear_turn_controller()
             try:
@@ -909,6 +918,16 @@ class FieldControlRuntime:
                     self._auto_selected = False
                     self.machine.stop("Programomstart")
             self.events.record("application_restart_fenced", timestamp_s=self._clock())
+
+    def begin_application_restart(self) -> None:
+        """Fence authority and queue zero output before process replacement.
+
+        Kept as the one-call API for non-HTTP owners.  HTTP callers use the
+        two stages so they can flush their positive acknowledgement between
+        the instantaneous admission fence and bounded STOP work.
+        """
+        if self.fence_application_restart():
+            self.complete_application_restart()
 
     def cancel_configuration_restart(self) -> None:
         """Release an uncommitted restart reservation after persistence failure."""

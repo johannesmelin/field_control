@@ -211,6 +211,31 @@ class VisionTests(unittest.TestCase):
         self.assertGreater(fallback.target_x, 14)
         self.assertTrue(fallback.bud_in_trigger_zone); self.assertTrue(fallback.bud_in_pick_zone)
 
+    def test_disabled_rows_cannot_supply_visual_target_or_master(self):
+        red = HsvFilter((0, 200, 200), (5, 255, 255), 4)
+        cfg = VisionConfig(navigation_mode="buds_only", buds=red,
+                           navigation_zone=Zone(0, .45, 0, 1), navigation_zone_2=Zone(.55, 1, 0, 1),
+                           trigger_zone=Zone(0, .45, .5, 1), trigger_zone_2=Zone(.55, 1, .5, 1),
+                           pick_zone=Zone(0, .45, .5, 1), pick_zone_2=Zone(.55, 1, .5, 1),
+                           row_1_enabled=False, row_2_enabled=True)
+        hsv = np.zeros((20, 20, 3), dtype=np.uint8)
+        hsv[10:14, 2:6] = (0, 255, 255); hsv[10:14, 15:19] = (0, 255, 255)
+        processor = VisionProcessor()
+        row_two_master = processor.process(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR), 1, cfg)
+        self.assertEqual(row_two_master.master_row, 2)
+        self.assertIsNone(row_two_master.row_1_target_x)
+        self.assertIsNotNone(row_two_master.row_2_target_x)
+        # Both disabled intentionally leaves AUTO with no visual target, so
+        # the existing runtime fallback may use IMU-only navigation.
+        none = processor.process(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR), 2,
+                                 VisionConfig(**{**cfg.__dict__, "row_2_enabled": False}))
+        self.assertIsNone(none.master_row)
+        self.assertIsNone(none.target_x)
+        # Harvest evidence deliberately remains independent of row target
+        # enablement; a bud in either trigger/pick zone is still observable.
+        self.assertTrue(none.bud_in_trigger_zone)
+        self.assertTrue(none.bud_in_pick_zone)
+
     def test_leaf_in_either_trigger_zone_never_triggers_pick(self):
         """Trigger membership is deliberately evaluated from the bud mask only."""
         green = HsvFilter((55, 200, 200), (65, 255, 255), 4)

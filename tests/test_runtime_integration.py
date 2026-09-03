@@ -136,6 +136,30 @@ class RuntimeIntegrationTests(unittest.TestCase):
         runtime._admit_command(WheelCommand(1, 1, "must not admit A2"))
         self.assertEqual(motor.commands, [])
 
+    def test_application_restart_fence_rejects_authority_before_bounded_stop_work(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Physical:
+            def __init__(self): self.armed = True; self.stops = []
+            def arm(self, _token): self.armed = True
+            def recoverable_stop_to_web_standby(self, _reason): return False
+            def stop_all(self, reason): self.stops.append(reason)
+
+        motor = Physical()
+        runtime = FieldControlRuntime(self._physical_config(), PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        self.assertTrue(runtime.fence_application_restart())
+        # The HTTP handler can now flush its accepted response while no new
+        # local command can race into the old process before STOP cleanup.
+        with self.assertRaisesRegex(ValueError, "programomstart väntar"):
+            runtime.manual_command(WheelCommand(1, 1, "must not admit"))
+        self.assertEqual(motor.stops, [])
+        runtime.complete_application_restart()
+        self.assertEqual(motor.stops, ["APPLICATION_RESTART"])
+
     def test_failed_configuration_restart_releases_only_verified_disarmed_fault_boundary(self):
         class PassiveSource:
             def __init__(self): self.latest = LatestValue()

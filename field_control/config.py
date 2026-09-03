@@ -191,6 +191,14 @@ class VisionConfig:
     trigger_zone_2: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .8, 1.0)
     pick_zone_2: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .5, 1.0)
     x_goal_2: float = .75
+    # Deployment identity for the first two-row camera.  It is deliberately
+    # configuration-only for now: acquisition continues using the existing
+    # CAM_B selection until multi-camera support is introduced.
+    camera_serial_number: str = ""
+    # Both rows remain active by default so profiles created before dual-row
+    # enablement keep their exact navigation behaviour.
+    row_1_enabled: bool = True
+    row_2_enabled: bool = True
 
     @property
     def x_goal_1(self) -> float:
@@ -222,6 +230,13 @@ class VisionConfig:
             raise ValueError("x_goal måste vara normaliserat till 0,0–1,0")
         if not 0 <= self.x_goal_2 <= 1:
             raise ValueError("x_goal_2 måste vara normaliserat till 0,0–1,0")
+        if not isinstance(self.camera_serial_number, str):
+            raise ValueError("camera_serial_number måste vara en sträng")
+        if (len(self.camera_serial_number) > 128
+                or any(character in self.camera_serial_number for character in "\r\n\x00")):
+            raise ValueError("camera_serial_number får vara högst 128 tecken utan radbrytning")
+        if not isinstance(self.row_1_enabled, bool) or not isinstance(self.row_2_enabled, bool):
+            raise ValueError("row_*_enabled måste vara booleska")
         if self.x_goal_top is not None and not 0 <= self.x_goal_top <= 1:
             raise ValueError("x_goal_top måste vara normaliserat till 0,0–1,0 eller null")
         if (not math.isfinite(self.ground_width_bottom_m) or not math.isfinite(self.ground_width_top_m)

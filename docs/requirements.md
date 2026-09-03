@@ -1259,6 +1259,8 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | `vision_deadband_px`          | Om absolutvärdet av `x_error` är mindre än detta antal pixlar görs ingen styrkorrigering.                                            |
 | `max_vision_correction_rpm`   | Maximalt tillåten differentialkorrektion i rpm från den visuella regulatorn.                                                         |
 | `x_goal` / `x_goal_2`         | x-positionerna för rad 1 respektive rad 2 i den processade bilden. Rad 1 är master när båda har giltigt mål; annars används rad 2. |
+| `row_1_enabled` / `row_2_enabled` | Anger om respektive rad får leverera visuellt navigationsmål. Båda är aktiva som standard; en inaktiverad rad kan inte väljas som master. |
+| `camera_serial_number` | Serienummer för kameran som hanterar rad 1 och 2. Sparas i konfigurationen för kommande fler-kamerastöd, men ändrar inte nuvarande kameraurval. |
 | `x_filter_window_frames`      | Antal giltiga bildmätningar per rad som används för tidsmässigt glidande medelvärde av dess `target_x`; historiker får inte delas. |
 | `x_outlier_threshold_px`      | Gräns för hur kraftigt en ny x-mätning får avvika innan den eventuellt ignoreras som outlier. Funktionen kan initialt vara avstängd. |
 | `navigation_lost_timeout_s`   | Hur länge giltiga visuella navigationsmål får saknas innan systemet går till `AUTO_SEARCH`.                                          |

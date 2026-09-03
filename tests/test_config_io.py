@@ -147,6 +147,32 @@ class ConfigIoTests(unittest.TestCase):
         }
         self.assertEqual(runtime_config_from_dict(legacy_document).vision.navigation_zone.__class__.__name__, "Zone")
 
+    def test_camera_serial_and_row_enablement_round_trip_with_legacy_defaults(self):
+        legacy = runtime_config_from_dict({"vision": {"x_goal": .4}})
+        self.assertEqual(legacy.vision.camera_serial_number, "")
+        self.assertTrue(legacy.vision.row_1_enabled)
+        self.assertTrue(legacy.vision.row_2_enabled)
+
+        document = runtime_config_to_dict(RuntimeConfig(vision=VisionConfig(
+            camera_serial_number="18443010C1A23F1200", row_1_enabled=False,
+            row_2_enabled=True)))
+        loaded = runtime_config_from_dict(document)
+        self.assertEqual(loaded.vision.camera_serial_number, "18443010C1A23F1200")
+        self.assertFalse(loaded.vision.row_1_enabled)
+        self.assertTrue(loaded.vision.row_2_enabled)
+
+    def test_camera_serial_and_row_enablement_have_strict_types(self):
+        document = runtime_config_to_dict(RuntimeConfig())
+        document["vision"]["camera_serial_number"] = 42
+        with self.assertRaisesRegex(ValueError, "camera_serial_number måste vara en sträng"):
+            runtime_config_from_dict(document)
+        document = runtime_config_to_dict(RuntimeConfig())
+        document["vision"]["row_1_enabled"] = 1
+        with self.assertRaisesRegex(ValueError, "row_1_enabled måste vara boolesk"):
+            runtime_config_from_dict(document)
+        with self.assertRaisesRegex(ValueError, "row_\\*_enabled måste vara booleska"):
+            VisionConfig(row_1_enabled=1).validate()  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()
