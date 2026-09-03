@@ -334,6 +334,20 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn(("Pragma", "no-cache"), headers)
         self.assertIn(("Expires", "0"), headers)
 
+    def test_cam_two_snapshot_routes_dispatch_to_explicit_cam_two_views(self):
+        runtime = FakeRuntime()
+        server = object.__new__(DiagnosticsServer); server.runtime = runtime
+        for view in ("cam2-raw", "cam2-buds", "cam2-leaves"):
+            with self.subTest(view=view):
+                runtime.images[view] = b"cam2-jpeg"
+                handler = object.__new__(server._handler())
+                response = []; handler.path = f"/snapshot/{view}"; handler.wfile = io.BytesIO()
+                handler.send_response = lambda status, *_args: response.append(status)
+                handler.send_header = lambda *_args: None; handler.end_headers = lambda: None
+                handler.do_GET()
+                self.assertEqual(response, [200])
+                self.assertEqual(handler.wfile.getvalue(), b"cam2-jpeg")
+
     def test_snapshot_returns_no_content_until_a_latest_frame_exists(self):
         runtime = FakeRuntime()
         server = object.__new__(DiagnosticsServer); server.runtime = runtime
@@ -541,8 +555,8 @@ class ManualWebTests(unittest.TestCase):
         # These are representative fields from every profile area, including
         # both row targets and the common turn-marker zone.
         for field in (
-            "x_goal(?:_2)?", "navigation_zone(?:_2)?", "trigger_zone(?:_2)?",
-            "pick_zone(?:_2)?", "turn_marker_zone", "first_crop",
+            "x_goal(?:_[2-4])?", "navigation_zone(?:_[2-4])?", "trigger_zone(?:_[2-4])?",
+            "pick_zone(?:_[2-4])?", "cam_[12]_serial_number", "turn_marker_zone", "first_crop",
             "odometry_geometry", "stream_", r"safety\.",
         ):
             self.assertIn(field, DASHBOARD_HTML)
@@ -599,6 +613,18 @@ class ManualWebTests(unittest.TestCase):
         self.assertIn("if(path==='vision.row_1_enabled'||path==='vision.row_2_enabled')label.classList.add('row-enabled')", DASHBOARD_HTML)
         self.assertIn("function rowZoneSlot(path,rowZones){const enabled=path.match(", DASHBOARD_HTML)
         self.assertIn("row_([12])_enabled", DASHBOARD_HTML)
+        # Each camera serial is placed directly above the first row it owns,
+        # and every row's enable switch is immediately beneath its heading.
+        self.assertIn("const cameraLabels={1:document.querySelector('input[data-path=\"vision.cam_1_serial_number\"]')?.parentElement,3:document.querySelector('input[data-path=\"vision.cam_2_serial_number\"]')?.parentElement}", DASHBOARD_HTML)
+        self.assertIn("title.textContent=`Cam ${row===1?1:2}`", DASHBOARD_HTML)
+        self.assertIn("cameraColumn.className='row-camera-column'", DASHBOARD_HTML)
+        self.assertIn("cameraColumn.append(camera,column)", DASHBOARD_HTML)
+        self.assertIn("if(enabled){enabled.classList.add('row-enabled');heading.after(enabled);}", DASHBOARD_HTML)
+        self.assertIn("for(let row=1;row<=4;row++)", DASHBOARD_HTML)
+        self.assertIn("`${zone[3]}_row_${zone[2]||'1'}`", DASHBOARD_HTML)
+        self.assertIn("`${kind}_boundaries_row_${row}`", DASHBOARD_HTML)
+        self.assertIn('aria-label="Cam 1 zone colours"', DASHBOARD_HTML)
+        self.assertIn('aria-label="Cam 2 zone colours"', DASHBOARD_HTML)
 
     def test_dashboard_row_labels_preserve_bound_inputs_when_rendered(self):
         from field_control.web import DASHBOARD_HTML
@@ -669,7 +695,7 @@ class ManualWebTests(unittest.TestCase):
     def test_dashboard_uses_bounded_cache_free_snapshot_polling_not_mjpeg(self):
         from field_control.web import DASHBOARD_HTML
 
-        for view in ("raw", "overlay", "buds", "leaves"):
+        for view in ("raw", "buds", "leaves", "cam2-raw", "cam2-buds", "cam2-leaves"):
             self.assertIn(f'data-snapshot-view="{view}"', DASHBOARD_HTML)
         self.assertNotIn('src="/stream/raw"', DASHBOARD_HTML)
         self.assertIn("const snapshotPollMs=100;", DASHBOARD_HTML)

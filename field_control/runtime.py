@@ -60,10 +60,11 @@ class FieldControlRuntime:
     """Owns lifecycle and joins latest sensor values without blocking control."""
 
     def __init__(self, config: RuntimeConfig, camera: CameraSource, imu: ImuSource,
+                 camera_2: CameraSource | None = None,
                  *, motor: MotorBoundary | None = None, odometry: object | None = None,
                  clock=time.monotonic, lease: ControlLease | None = None) -> None:
         self.config = config.validate()
-        self.camera, self.imu = camera, imu
+        self.camera, self.camera_2, self.imu = camera, camera_2, imu
         self.motor = motor or DisabledMotorBoundary()
         self.lease = lease or ControlLease(self.config.control_lease_timeout_s, clock=clock)
         motor_lease = getattr(self.motor, "control_lease", None)
@@ -79,6 +80,7 @@ class FieldControlRuntime:
         # Vision (and therefore cv2) stays lazy: MANUAL diagnostics/HIL must
         # be able to start their watchdog without an image-processing stack.
         self.vision_processor: "VisionProcessor | None" = None
+        self.vision_processor_2: "VisionProcessor | None" = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
@@ -87,8 +89,11 @@ class FieldControlRuntime:
         self._lifecycle_lock = threading.RLock()
         self._lifecycle = _Lifecycle.NEW
         self._last_frame_timestamp: float | None = None
+        self._last_frame_2_timestamp: float | None = None
         self._vision: VisionResult | None = None
         self._frame: object | None = None
+        self._frame_2: object | None = None
+        self._vision_2: VisionResult | None = None
         self._observation: SensorObservation | None = None
         self._last_snapshot = self.machine.snapshot(self._clock())
         self._last_command: WheelCommand | None = None
@@ -254,6 +259,8 @@ class FieldControlRuntime:
             return
         self._stop.clear()
         sources = [self.camera, self.imu]
+        if self.camera_2 is not None:
+            sources.append(self.camera_2)
         if self._odometry is not None:
             sources.append(self._odometry)
         try:
@@ -347,7 +354,7 @@ class FieldControlRuntime:
             except RuntimeError as exc:
                 failure = exc
                 self._record_fault(f"SHUTDOWN_STOP_FAILURE: {type(exc).__name__}: {exc}")
-        for source in (self.camera, self.imu, self._odometry):
+        for source in (self.camera, self.camera_2, self.imu, self._odometry):
             stop = getattr(source, "stop", None)
             if not callable(stop):
                 continue
@@ -462,19 +469,54 @@ class FieldControlRuntime:
             except ValueError as exc:
                 imu = SourceSnapshot(imu.value, imu.updated_at_s, False, str(exc))
             self._last_imu_timestamp = imu.updated_at_s
+        # CAM_1 is the only source coupled to the IMU and the baseline camera
+        # safety deadline. CAM_2 is assessed independently below: losing it
+        # is a fail-closed condition only while rows 3/4 are enabled.
         frame = camera.value
         if frame is not None and camera.updated_at_s != self._last_frame_timestamp:
             if self.vision_processor is None:
                 from .vision import VisionProcessor
                 self.vision_processor = VisionProcessor()
-            self._vision = self.vision_processor.process(frame, camera.updated_at_s or now, self.config.vision)
+            self._vision = self.vision_processor.process(frame, camera.updated_at_s or now, self.config.vision,
+                                                          rows=(1, 2))
             self._frame = self._vision.raw_frame
             self._last_frame_timestamp = camera.updated_at_s
+        camera_2 = self.camera_2.latest.snapshot() if self.camera_2 is not None else None
+        if camera_2 is not None and camera_2.value is not None and camera_2.updated_at_s != self._last_frame_2_timestamp:
+            if self.vision_processor_2 is None:
+                from .vision import VisionProcessor
+                self.vision_processor_2 = VisionProcessor()
+            self._vision_2 = self.vision_processor_2.process(camera_2.value, camera_2.updated_at_s or now,
+                                                               self.config.vision, rows=(3, 4))
+            self._frame_2 = self._vision_2.raw_frame
+            self._last_frame_2_timestamp = camera_2.updated_at_s
+        if self.camera_2 is not None or self._vision_2 is not None:
+            self._vision = self._combine_camera_vision(self._vision, self._vision_2)
         odometry_snapshot = self._odometry_snapshot(now)
         sensor = build_observation(
             now, camera, imu, odometry_snapshot, self._vision, self.heading,
             self.config.camera_timeout_s, self.config.imu_timeout_s, self.config.odometry_timeout_s,
         )
+        cam2_required = self.config.vision.row_3_enabled or self.config.vision.row_4_enabled
+        cam2_fresh = (camera_2 is not None and camera_2.connected and camera_2.age_s(now) is not None
+                      and camera_2.age_s(now) <= self.config.camera_timeout_s)
+        if cam2_required and not cam2_fresh:
+            # Rows 3/4 are configured as active harvest/navigation evidence.
+            # Continuing without their camera could miss a bud trigger, so
+            # stop safely. Operators can disable both rows for CAM_1-only
+            # operation; that bounded fallback does not impair IMU-only.
+            sensor = replace(sensor, fault="CAMERA_2_TIMEOUT")
+            # In MANUAL this remains a diagnostic/start gate only: no output
+            # is dispatched by the periodic runtime. Once AUTO is selected
+            # or running, missing enabled row 3/4 evidence can miss a bud
+            # trigger and must stop before any further AUTO command.
+            with self._lock:
+                self._observation = sensor
+            with self._state_lock:
+                auto_active = self._auto_selected or self.machine.state.value.startswith("AUTO")
+            if auto_active:
+                self._fail_closed("CAMERA_2_TIMEOUT")
+                return self.status()
         degraded_auto = self._is_physical_output() and not sensor.odometry_fresh
         if degraded_auto:
             # This substitution is limited to the typed right-encoder outage.
@@ -570,6 +612,47 @@ class FieldControlRuntime:
         with self._lock:
             self._observation, self._last_snapshot = sensor, snapshot
         return self.status()
+
+    @staticmethod
+    def _combine_camera_vision(cam_1: "VisionResult | None", cam_2: "VisionResult | None") -> "VisionResult | None":
+        """Merge independent camera evidence with deterministic row priority.
+
+        The greatest enabled row number with a valid target is master.  This
+        deliberately happens after each camera has processed its own pixels,
+        so no frame or target history crosses camera boundaries.
+        """
+        if cam_1 is None and cam_2 is None:
+            return None
+        base = cam_1 or cam_2
+        assert base is not None
+        targets: dict[int, tuple[float | None, float | None]] = {}
+        triggered: dict[int, bool] = {}
+        picking: dict[int, bool] = {}
+        # A per-camera processor intentionally has no knowledge of the
+        # other sensor.  It therefore represents absent rows as ``None``.
+        # Never let CAM_2's absent rows 1/2 overwrite CAM_1's actual target
+        # (or vice versa) while aggregating independent frames.
+        for result, owned_rows in ((cam_1, (1, 2)), (cam_2, (3, 4))):
+            if result is None: continue
+            result_targets = result.row_targets or {}
+            result_triggered = result.row_triggered or {}
+            result_picking = result.row_picking or {}
+            targets.update({row: result_targets.get(row, (None, None)) for row in owned_rows})
+            triggered.update({row: bool(result_triggered.get(row, False)) for row in owned_rows})
+            picking.update({row: bool(result_picking.get(row, False)) for row in owned_rows})
+        master = next((row for row in sorted(targets, reverse=True) if targets[row][0] is not None), None)
+        target_x, target_y = targets.get(master, (None, None))
+        masks = dict(base.masks)
+        # CAM_2 masks are only used for its own web view; the aggregate masks
+        # must not resize/mix distinct camera coordinate systems.
+        return replace(base, target_x=target_x, target_y=target_y, master_row=master,
+                       bud_in_trigger_zone=any(triggered.values()), bud_in_pick_zone=any(picking.values()),
+                       marker_found=bool((cam_1 and cam_1.marker_found) or (cam_2 and cam_2.marker_found)),
+                       row_1_target_x=targets.get(1, (None, None))[0], row_1_target_y=targets.get(1, (None, None))[1],
+                       row_2_target_x=targets.get(2, (None, None))[0], row_2_target_y=targets.get(2, (None, None))[1],
+                       row_3_target_x=targets.get(3, (None, None))[0], row_3_target_y=targets.get(3, (None, None))[1],
+                       row_4_target_x=targets.get(4, (None, None))[0], row_4_target_y=targets.get(4, (None, None))[1],
+                       row_targets=targets, row_triggered=triggered, row_picking=picking, masks=masks)
 
     def _run(self) -> None:
         period = 1.0 / max(1.0, self.config.navigation_frame_rate_hz)
@@ -2119,6 +2202,8 @@ class FieldControlRuntime:
             observation = self._observation
         if observation is None:
             raise ValueError("sensorobservation saknas")
+        if observation.fault is not None:
+            raise ValueError(f"AUTO-start nekas: {observation.fault}")
         hook = self._before_auto_start_transition
         if hook is not None:
             hook()
@@ -2324,7 +2409,12 @@ class FieldControlRuntime:
 
     def latest_image(self, view: str) -> bytes | None:
         with self._lock:
-            frame, result = self._frame, self._vision
+            cam_2_view = view.startswith("cam2-")
+            if cam_2_view:
+                view = view.removeprefix("cam2-")
+                frame, result = self._frame_2, self._vision_2
+            else:
+                frame, result = self._frame, self._vision
             if frame is None:
                 return None
             if view == "raw":
@@ -2332,7 +2422,8 @@ class FieldControlRuntime:
                 # as the overlay; detections and target annotations remain
                 # absent here.
                 from .vision import VisionProcessor
-                image = VisionProcessor.draw_navigation_guides(frame, self.config.vision)
+                image = VisionProcessor.draw_navigation_guides(
+                    frame, self.config.vision, rows=(3, 4) if cam_2_view else (1, 2))
             elif view == "overlay" and result is not None: image = result.overlay
             elif result is not None: image = result.masks.get(view)
             else: image = None

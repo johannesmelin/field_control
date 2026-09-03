@@ -103,9 +103,9 @@ def _vision(value: Any) -> VisionConfig:
             kwargs[field.name] = getattr(defaults, field.name) if field.name not in data else _first_crop(item, path)
         elif field.name == "navigation_mode":
             kwargs[field.name] = _string(item, path)
-        elif field.name == "camera_serial_number":
+        elif field.name in ("camera_serial_number", "cam_1_serial_number", "cam_2_serial_number"):
             kwargs[field.name] = _string(item, path)
-        elif field.name in ("row_1_enabled", "row_2_enabled"):
+        elif field.name.startswith("row_") and field.name.endswith("_enabled"):
             kwargs[field.name] = _boolean(item, path)
         elif field.name == "x_filter_window_frames":
             kwargs[field.name] = _integer(item, path)
@@ -115,6 +115,14 @@ def _vision(value: Any) -> VisionConfig:
             kwargs[field.name] = None if item is None else _number(item, path)
         else:
             kwargs[field.name] = _number(item, path)
+    # Profiles predating the explicit CAM_1 name stored this identity under
+    # camera_serial_number. Normalise it at the configuration boundary so
+    # the new UI presents and persists the real configured CAM_1 value.
+    # Profile merging first introduces the deployment's empty new field, so
+    # treat that empty value exactly like an absent field when an older
+    # profile carries a real legacy camera_serial_number.
+    if not kwargs["cam_1_serial_number"] and kwargs["camera_serial_number"]:
+        kwargs["cam_1_serial_number"] = kwargs["camera_serial_number"]
     if isinstance(kwargs["turn_marker_zone"], GoalRelativeZone):
         raise ValueError("vision.turn_marker_zone stöder inte målrelativ zon")
     return VisionConfig(**kwargs)

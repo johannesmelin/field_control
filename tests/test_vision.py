@@ -58,6 +58,16 @@ class VisionTests(unittest.TestCase):
         self.assertTrue(np.array_equal(original[2, 3], result.overlay[2, 3]))
         self.assertTrue(np.array_equal(original[1, 10], result.overlay[1, 10]))
 
+    def test_disabled_camera_rows_hide_all_original_guides(self):
+        cfg = VisionConfig(navigation_zone=Zone(.1, .3, .1, .3),
+                           trigger_zone=Zone(.4, .6, .4, .6),
+                           pick_zone=Zone(.7, .9, .7, .9),
+                           turn_marker_zone=Zone(.1, .2, .7, .8),
+                           x_goal=.5, row_1_enabled=False, row_2_enabled=False)
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        guide = VisionProcessor.draw_navigation_guides(frame, cfg, rows=(1, 2))
+        self.assertTrue(np.array_equal(guide, frame))
+
     def test_first_crop_is_the_processed_and_raw_frame_coordinate_system(self):
         hsv = np.zeros((20, 20, 3), dtype=np.uint8)
         hsv[8:12, 12:16] = (0, 255, 255)
@@ -231,10 +241,24 @@ class VisionTests(unittest.TestCase):
                                  VisionConfig(**{**cfg.__dict__, "row_2_enabled": False}))
         self.assertIsNone(none.master_row)
         self.assertIsNone(none.target_x)
-        # Harvest evidence deliberately remains independent of row target
-        # enablement; a bud in either trigger/pick zone is still observable.
-        self.assertTrue(none.bud_in_trigger_zone)
-        self.assertTrue(none.bud_in_pick_zone)
+        # A disabled row supplies neither navigation nor harvest evidence:
+        # its camera can then be intentionally unavailable without a hidden
+        # trigger path.
+        self.assertFalse(none.bud_in_trigger_zone)
+        self.assertFalse(none.bud_in_pick_zone)
+
+    def test_rows_three_and_four_are_independent_and_are_processed_on_cam_two(self):
+        red = HsvFilter((0, 200, 200), (5, 255, 255), 4)
+        cfg = VisionConfig(navigation_mode="buds_only", buds=red,
+                           navigation_zone_3=Zone(0, .45, 0, 1), navigation_zone_4=Zone(.55, 1, 0, 1),
+                           trigger_zone_3=Zone(0, .45, .5, 1), trigger_zone_4=Zone(.55, 1, .5, 1),
+                           row_3_enabled=True, row_4_enabled=True)
+        hsv = np.zeros((20, 20, 3), dtype=np.uint8)
+        hsv[10:14, 2:6] = (0, 255, 255); hsv[10:14, 15:19] = (0, 255, 255)
+        result = VisionProcessor().process(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR), 1, cfg, rows=(3, 4))
+        self.assertEqual(result.master_row, 3)
+        self.assertIsNotNone(result.row_3_target_x); self.assertIsNotNone(result.row_4_target_x)
+        self.assertTrue(result.row_triggered[3]); self.assertTrue(result.row_triggered[4])
 
     def test_leaf_in_either_trigger_zone_never_triggers_pick(self):
         """Trigger membership is deliberately evaluated from the bud mask only."""

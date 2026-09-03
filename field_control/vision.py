@@ -32,11 +32,18 @@ class VisionResult:
     row_1_target_y: float | None = None
     row_2_target_x: float | None = None
     row_2_target_y: float | None = None
+    row_3_target_x: float | None = None
+    row_3_target_y: float | None = None
+    row_4_target_x: float | None = None
+    row_4_target_y: float | None = None
+    row_targets: dict[int, tuple[float | None, float | None]] | None = None
+    row_triggered: dict[int, bool] | None = None
+    row_picking: dict[int, bool] | None = None
 
 
 class VisionProcessor:
     def __init__(self) -> None:
-        self._history: dict[int, deque[float]] = {1: deque(), 2: deque()}
+        self._history: dict[int, deque[float]] = {row: deque() for row in range(1, 5)}
 
     @staticmethod
     def _mask(hsv: np.ndarray, hsv_filter: HsvFilter) -> np.ndarray:
@@ -83,7 +90,8 @@ class VisionProcessor:
         area = sum(item[2] for item in parts)
         return None if area == 0 else sum(y * size for _x, y, size in parts) / area
 
-    def process(self, frame: np.ndarray, timestamp_s: float, config: VisionConfig) -> VisionResult:
+    def process(self, frame: np.ndarray, timestamp_s: float, config: VisionConfig,
+                *, rows: tuple[int, ...] = (1, 2)) -> VisionResult:
         config.validate()
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError("BGR-frame med tre kanaler krävs")
@@ -96,28 +104,25 @@ class VisionProcessor:
         # processed coordinate system.
         frame = frame[y0:y1, x0:x1].copy()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        navigation_zone_1 = config.effective_zone(config.navigation_zone, 1)
-        navigation_zone_2 = config.effective_zone(config.navigation_zone_2, 2)
-        trigger_zone_1 = config.effective_zone(config.trigger_zone, 1)
-        trigger_zone_2 = config.effective_zone(config.trigger_zone_2, 2)
-        pick_zone_1 = config.effective_zone(config.pick_zone, 1)
-        pick_zone_2 = config.effective_zone(config.pick_zone_2, 2)
+        if not rows or any(row not in (1, 2, 3, 4) for row in rows):
+            raise ValueError("vision måste bearbeta minst en rad 1–4")
+        navigation_zones = {row: config.effective_zone(config.row_zone("navigation", row), row) for row in rows}
+        trigger_zones = {row: config.effective_zone(config.row_zone("trigger", row), row) for row in rows}
+        pick_zones = {row: config.effective_zone(config.row_zone("pick", row), row) for row in rows}
         marker_zone = config.effective_zone(config.turn_marker_zone)
         bud_mask = self._mask(hsv, config.buds)
         leaf_mask = self._mask(hsv, config.leaves)
-        buds_1 = self._in_zone(bud_mask, navigation_zone_1)
-        buds_2 = self._in_zone(bud_mask, navigation_zone_2)
-        leaves_1 = self._in_zone(leaf_mask, navigation_zone_1)
-        leaves_2 = self._in_zone(leaf_mask, navigation_zone_2)
+        buds = {row: self._in_zone(bud_mask, navigation_zones[row]) for row in rows}
+        leaves = {row: self._in_zone(leaf_mask, navigation_zones[row]) for row in rows}
         marker = self._in_zone(self._mask(hsv, config.marker), marker_zone)
-        buds_1, bud_parts_1 = self._components(buds_1, config.buds.min_area)
-        buds_2, bud_parts_2 = self._components(buds_2, config.buds.min_area)
-        leaves_1, leaf_parts_1 = self._components(leaves_1, config.leaves.min_area)
-        leaves_2, leaf_parts_2 = self._components(leaves_2, config.leaves.min_area)
+        bud_parts = {}; leaf_parts = {}
+        for row in rows:
+            buds[row], bud_parts[row] = self._components(buds[row], config.buds.min_area)
+            leaves[row], leaf_parts[row] = self._components(leaves[row], config.leaves.min_area)
         marker, marker_parts = self._components(marker, config.marker.min_area)
         def target_for(row: int, bud_parts: list[tuple[float, float, float]],
                        leaf_parts: list[tuple[float, float, float]]) -> tuple[float | None, float | None]:
-            if not (config.row_1_enabled if row == 1 else config.row_2_enabled):
+            if not config.row_enabled(row):
                 # Never retain stale measurements while an operator has
                 # disabled this row.  Re-enabling it must acquire a fresh
                 # visual target rather than revive an old filtered target.
@@ -137,35 +142,46 @@ class VisionProcessor:
             self._history[row] = history
             return (None if raw_x is None or not history else sum(history) / len(history), target_y)
 
-        row_1_x, row_1_y = target_for(1, bud_parts_1, leaf_parts_1)
-        row_2_x, row_2_y = target_for(2, bud_parts_2, leaf_parts_2)
-        master_row = 1 if row_1_x is not None else 2 if row_2_x is not None else None
-        target_x, target_y = ((row_1_x, row_1_y) if master_row == 1 else
-                              (row_2_x, row_2_y) if master_row == 2 else (None, None))
-        trigger_1 = self._in_zone(bud_mask, trigger_zone_1)
-        trigger_2 = self._in_zone(bud_mask, trigger_zone_2)
-        pick_1 = self._in_zone(bud_mask, pick_zone_1)
-        pick_2 = self._in_zone(bud_mask, pick_zone_2)
-        display_buds = cv2.bitwise_or(buds_1, buds_2)
-        display_leaves = cv2.bitwise_or(leaves_1, leaves_2)
+        targets = {row: target_for(row, bud_parts[row], leaf_parts[row]) for row in rows}
+        # Preserve the established row-local priority. Cross-camera priority
+        # is applied by FieldControlRuntime after both independent results
+        # have been merged.
+        master_row = next((row for row in rows if targets[row][0] is not None), None)
+        target_x, target_y = targets[master_row] if master_row is not None else (None, None)
+        triggered = {row: bool(cv2.countNonZero(self._in_zone(bud_mask, trigger_zones[row]))) and config.row_enabled(row) for row in rows}
+        picking = {row: bool(cv2.countNonZero(self._in_zone(bud_mask, pick_zones[row]))) and config.row_enabled(row) for row in rows}
+        display_buds = np.zeros_like(bud_mask); display_leaves = np.zeros_like(leaf_mask)
+        for row in rows:
+            display_buds = cv2.bitwise_or(display_buds, buds[row]); display_leaves = cv2.bitwise_or(display_leaves, leaves[row])
         overlay = self._overlay(frame, config, target_x, display_buds, display_leaves, marker)
+        all_targets = {row: targets.get(row, (None, None)) for row in range(1, 5)}
         return VisionResult(timestamp_s, target_x, target_y,
-                            bool(cv2.countNonZero(trigger_1) or cv2.countNonZero(trigger_2)),
-                            bool(cv2.countNonZero(pick_1) or cv2.countNonZero(pick_2)), bool(marker_parts),
+                            any(triggered.values()), any(picking.values()), bool(marker_parts),
                             {"buds": display_buds, "leaves": display_leaves, "marker": marker}, overlay, frame,
-                            master_row, row_1_x, row_1_y, row_2_x, row_2_y)
+                            master_row, *all_targets[1], *all_targets[2], *all_targets[3], *all_targets[4],
+                            all_targets, triggered, picking)
 
     @staticmethod
-    def draw_zones(image: np.ndarray, config: VisionConfig) -> np.ndarray:
+    def draw_zones(image: np.ndarray, config: VisionConfig, *, rows: tuple[int, ...] = (1, 2)) -> np.ndarray:
         """Return a copy with precisely the shared diagnostic zone lines."""
         image = image.copy(); height, width = image.shape[:2]
+        enabled_rows = tuple(row for row in rows if config.row_enabled(row))
+        # A disabled camera has no active rows. Do not present its guides as
+        # operational evidence in the Original view.
+        if not enabled_rows:
+            return image
         # Row 1 is the established palette; row 2 uses lighter/darker
         # companions so the two independent regions remain distinguishable.
         zones = ((config.navigation_zone, 1, (255, 180, 0)), (config.trigger_zone, 1, (0, 255, 255)),
                  (config.pick_zone, 1, (255, 0, 255)), (config.navigation_zone_2, 2, (255, 255, 0)),
                  (config.trigger_zone_2, 2, (0, 180, 180)), (config.pick_zone_2, 2, (180, 0, 255)),
+                 (config.navigation_zone_3, 3, (255, 180, 0)), (config.trigger_zone_3, 3, (0, 255, 255)),
+                 (config.pick_zone_3, 3, (255, 0, 255)), (config.navigation_zone_4, 4, (255, 255, 0)),
+                 (config.trigger_zone_4, 4, (0, 180, 180)), (config.pick_zone_4, 4, (180, 0, 255)),
                  (config.turn_marker_zone, 1, (0, 180, 255)))
         for configured_zone, row, colour in zones:
+            if row not in enabled_rows and configured_zone is not config.turn_marker_zone:
+                continue
             zone = config.effective_zone(configured_zone, row)
             if isinstance(zone, Zone):
                 x0, x1, y0, y1 = zone.pixels(width, height)
@@ -175,18 +191,20 @@ class VisionProcessor:
         return image
 
     @staticmethod
-    def draw_navigation_guides(image: np.ndarray, config: VisionConfig) -> np.ndarray:
+    def draw_navigation_guides(image: np.ndarray, config: VisionConfig, *, rows: tuple[int, ...] = (1, 2)) -> np.ndarray:
         """Return camera evidence with the shared zones and configured x goal.
 
         This deliberately excludes segmentation and target annotations.  The
         Original dashboard view can therefore show its operational reference
         without pretending that a target was detected.
         """
-        image = VisionProcessor.draw_zones(image, config)
+        image = VisionProcessor.draw_zones(image, config, rows=rows)
         height, width = image.shape[:2]
         # Draw row 2 first: row 1 retains its established red guide at a
         # crossing, which also makes master priority visually unsurprising.
-        for row, colour in ((2, (0, 80, 255)), (1, (0, 0, 255))):
+        colours = {1: (0, 0, 255), 2: (0, 80, 255), 3: (0, 0, 255), 4: (0, 80, 255)}
+        for row in sorted((row for row in rows if config.row_enabled(row)), reverse=True):
+            colour = colours[row]
             goal_top = round(config.goal_x_normalized(0, height, row) * (width - 1))
             goal_bottom = round(config.goal_x_normalized(height - 1, height, row) * (width - 1))
             cv2.line(image, (goal_top, 0), (goal_bottom, height - 1), colour, 2)

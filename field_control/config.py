@@ -199,6 +199,52 @@ class VisionConfig:
     # enablement keep their exact navigation behaviour.
     row_1_enabled: bool = True
     row_2_enabled: bool = True
+    # CAM_1 is the OAK carrying the verified IMU and rows 1–2.  Keep the
+    # old camera_serial_number as a read-compatible alias while deployments
+    # migrate to the explicit two-camera names.
+    cam_1_serial_number: str = ""
+    cam_2_serial_number: str = "1944301061E6065B00"
+    navigation_zone_3: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .3, 1.0)
+    trigger_zone_3: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .8, 1.0)
+    pick_zone_3: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .5, 1.0)
+    x_goal_3: float = .25
+    # A legacy one-camera profile must remain operable until the operator
+    # explicitly enables CAM_2 rows after installation/verification.
+    row_3_enabled: bool = False
+    navigation_zone_4: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .3, 1.0)
+    trigger_zone_4: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .8, 1.0)
+    pick_zone_4: Zone | TrapezoidZone | GoalRelativeZone = GoalRelativeZone(.3, .5, 1.0)
+    x_goal_4: float = .75
+    row_4_enabled: bool = False
+
+    def camera_serial_for(self, camera: int) -> str:
+        if camera == 1:
+            return self.cam_1_serial_number or self.camera_serial_number
+        if camera == 2:
+            return self.cam_2_serial_number
+        raise ValueError("kamera måste vara 1 eller 2")
+
+    @staticmethod
+    def camera_for_row(row: int) -> int:
+        if row in (1, 2): return 1
+        if row in (3, 4): return 2
+        raise ValueError("rad måste vara 1–4")
+
+    def row_enabled(self, row: int) -> bool:
+        try: return getattr(self, f"row_{row}_enabled")
+        except AttributeError as exc: raise ValueError("rad måste vara 1–4") from exc
+
+    def row_goal(self, row: int) -> float:
+        if row == 1: return self.x_goal
+        try: return getattr(self, f"x_goal_{row}")
+        except AttributeError as exc: raise ValueError("rad måste vara 1–4") from exc
+
+    def row_zone(self, kind: str, row: int) -> Zone | TrapezoidZone | GoalRelativeZone:
+        if kind not in ("navigation", "trigger", "pick"):
+            raise ValueError("okänd zontyp")
+        suffix = "" if row == 1 else f"_{row}"
+        try: return getattr(self, f"{kind}_zone{suffix}")
+        except AttributeError as exc: raise ValueError("rad måste vara 1–4") from exc
 
     @property
     def x_goal_1(self) -> float:
@@ -222,29 +268,29 @@ class VisionConfig:
             raise ValueError("navigation_mode måste vara buds_only eller buds_and_leaves")
         self.buds.validate(); self.leaves.validate(); self.marker.validate()
         self.navigation_zone.validate(); self.trigger_zone.validate(); self.pick_zone.validate(); self.turn_marker_zone.validate()
-        self.navigation_zone_2.validate(); self.trigger_zone_2.validate(); self.pick_zone_2.validate()
+        for row in range(2, 5):
+            self.row_zone("navigation", row).validate(); self.row_zone("trigger", row).validate(); self.row_zone("pick", row).validate()
         if isinstance(self.turn_marker_zone, GoalRelativeZone):
             raise ValueError("turn_marker_zone stöder inte målrelativ zon")
         self.first_crop.validate()
         if not 0 <= self.x_goal <= 1:
             raise ValueError("x_goal måste vara normaliserat till 0,0–1,0")
-        if not 0 <= self.x_goal_2 <= 1:
-            raise ValueError("x_goal_2 måste vara normaliserat till 0,0–1,0")
-        if not isinstance(self.camera_serial_number, str):
-            raise ValueError("camera_serial_number måste vara en sträng")
-        if (len(self.camera_serial_number) > 128
-                or any(character in self.camera_serial_number for character in "\r\n\x00")):
-            raise ValueError("camera_serial_number får vara högst 128 tecken utan radbrytning")
-        if not isinstance(self.row_1_enabled, bool) or not isinstance(self.row_2_enabled, bool):
+        for row in range(1, 5):
+            if not 0 <= self.row_goal(row) <= 1:
+                raise ValueError(f"x_goal_{row} måste vara normaliserat till 0,0–1,0")
+        for serial_name in ("camera_serial_number", "cam_1_serial_number", "cam_2_serial_number"):
+            serial = getattr(self, serial_name)
+            if not isinstance(serial, str) or len(serial) > 128 or any(character in serial for character in "\r\n\x00"):
+                raise ValueError(f"{serial_name} måste vara högst 128 tecken utan radbrytning")
+        if any(not isinstance(self.row_enabled(row), bool) for row in range(1, 5)):
             raise ValueError("row_*_enabled måste vara booleska")
         if self.x_goal_top is not None and not 0 <= self.x_goal_top <= 1:
             raise ValueError("x_goal_top måste vara normaliserat till 0,0–1,0 eller null")
         if (not math.isfinite(self.ground_width_bottom_m) or not math.isfinite(self.ground_width_top_m)
                 or self.ground_width_bottom_m <= 0 or self.ground_width_top_m <= 0):
             raise ValueError("ground_width_*_m måste vara positiva ändliga meter")
-        for zone, row in ((self.navigation_zone, 1), (self.trigger_zone, 1),
-                          (self.pick_zone, 1), (self.navigation_zone_2, 2),
-                          (self.trigger_zone_2, 2), (self.pick_zone_2, 2)):
+        for row in range(1, 5):
+          for zone in (self.row_zone("navigation", row), self.row_zone("trigger", row), self.row_zone("pick", row)):
             if isinstance(zone, GoalRelativeZone):
                 self._effective_goal_relative_zone(zone, row).validate()
         if self.x_filter_window_frames < 1:
@@ -255,7 +301,7 @@ class VisionConfig:
 
     def _goal_x_endpoints(self, row: int = 1) -> tuple[float, float]:
         """Return processed-image top and bottom x-goal endpoints."""
-        goal = self.x_goal if row == 1 else self.x_goal_2
+        goal = self.row_goal(row)
         if self.x_goal_top is not None:
             # Preserve the explicitly calibrated row-1 top endpoint.  Row 2
             # follows the same physical projection unless separately modelled.
@@ -286,7 +332,7 @@ class VisionConfig:
         Keeping the old constant when no top endpoint is configured is an
         explicit backwards-compatibility contract.
         """
-        goal = self.x_goal if row == 1 else self.x_goal_2
+        goal = self.row_goal(row)
         return goal if height <= 1 else self.goal_x_normalized_fraction(float(y_px) / float(height - 1), row)
 
     def _effective_goal_relative_zone(self, zone: GoalRelativeZone, row: int = 1) -> Zone | TrapezoidZone:

@@ -14,6 +14,17 @@ from field_control.config_io import (dump_runtime_config, load_runtime_config,
 
 
 class ConfigIoTests(unittest.TestCase):
+    def test_four_row_camera_serials_round_trip_with_legacy_cam_one_alias(self):
+        config = RuntimeConfig(vision=VisionConfig(camera_serial_number="legacy-cam-1",
+                                                   cam_2_serial_number="cam-2", row_3_enabled=False,
+                                                   x_goal_3=.3, x_goal_4=.7))
+        legacy = runtime_config_to_dict(config)
+        legacy["vision"].pop("cam_1_serial_number")
+        loaded = runtime_config_from_dict(legacy)
+        self.assertEqual(loaded.vision.camera_serial_for(1), "legacy-cam-1")
+        self.assertEqual(loaded.vision.cam_1_serial_number, "legacy-cam-1")
+        self.assertEqual(loaded.vision.camera_serial_for(2), "cam-2")
+        self.assertFalse(loaded.vision.row_3_enabled)
     def test_round_trip_preserves_nested_config_and_safe_disabled_output(self):
         config = RuntimeConfig(imu_sample_hz=77, manual_rpm=4.5, log_level="DEBUG", stream_enabled=False)
         with tempfile.TemporaryDirectory() as directory:

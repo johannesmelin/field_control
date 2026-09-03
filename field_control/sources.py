@@ -547,9 +547,12 @@ class DepthAICombinedBackend:
     """One OAK-D pipeline exposing independent bounded camera/IMU queues."""
 
     def __init__(self, width: int, height: int, camera_fps: float, imu_rate_hz: int,
-                 heading_converter: Callable[[tuple[float, float, float, float]], float] = heading_from_imu_quaternion) -> None:
+                 heading_converter: Callable[[tuple[float, float, float, float]], float] = heading_from_imu_quaternion,
+                 *, device_id: str | None = None) -> None:
         self.width, self.height, self.camera_fps, self.imu_rate_hz = width, height, camera_fps, imu_rate_hz
         self.heading_converter = heading_converter
+        self.device_id = device_id or None
+        self._device = None
         self._pipeline = None
         self._camera_queue = None
         self._imu_queue = None
@@ -560,7 +563,11 @@ class DepthAICombinedBackend:
             if self._pipeline is not None:
                 return
             import depthai as dai
-            pipeline = dai.Pipeline()
+            # Explicitly bind CAM_1 when configured.  IMU and camera frames
+            # must originate in this one calibrated OAK; silently selecting
+            # an arbitrary connected camera would invalidate IMU-only mode.
+            self._device = dai.Device(dai.DeviceInfo(self.device_id)) if self.device_id else None
+            pipeline = dai.Pipeline(self._device) if self._device is not None else dai.Pipeline()
             camera = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
             imu = pipeline.create(dai.node.IMU)
             device = pipeline.getDefaultDevice()
@@ -612,3 +619,39 @@ class DepthAICombinedBackend:
                 pipeline.stop(); pipeline.wait()
             except Exception:
                 pass
+        device, self._device = self._device, None
+        if device is not None:
+            try: device.close()
+            except Exception: pass
+
+
+class DepthAIVideoBackend:
+    """Bounded CAM_B video-only pipeline explicitly bound to CAM_2."""
+
+    def __init__(self, width: int, height: int, fps: float, device_id: str) -> None:
+        if not device_id:
+            raise ValueError("CAM_2 kräver ett konfigurerat serienummer")
+        self.width, self.height, self.fps, self.device_id = width, height, fps, device_id
+        self._pipeline = None; self._device = None; self._queue = None
+
+    def frames(self):
+        import depthai as dai
+        self._device = dai.Device(dai.DeviceInfo(self.device_id))
+        self._pipeline = dai.Pipeline(self._device)
+        camera = self._pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+        self._queue = _full_fov_camera_output(camera, dai, self.width, self.height, self.fps)
+        self._pipeline.start()
+        while True:
+            packet = self._queue.tryGet()
+            if packet is not None: yield packet.getCvFrame()
+            else: threading.Event().wait(.002)
+
+    def close(self) -> None:
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            try: pipeline.stop(); pipeline.wait()
+            except Exception: pass
+        device, self._device = self._device, None
+        if device is not None:
+            try: device.close()
+            except Exception: pass

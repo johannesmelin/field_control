@@ -9,11 +9,16 @@ och ett framtida säkert motorlager.
 
 Följande är implementerat och verifierat utan anslutna motorer eller CAN:
 
-- OAK-D SR CAM_B och BNO086 körs i samma DepthAI-pipeline.
+- Cam 1 (OAK-D SR CAM_B + BNO086) körs i en gemensam, serienummerbunden DepthAI-pipeline.
+- Cam 2 (OAK-D SR CAM_B) är en separat, serienummerbunden video-only-källa för rad 3–4.
 - Kamera och IMU exponeras som oberoende bounded latest-value-källor.
 - Alla sensoråldrar använder monotonic tid.
 - Kamera, IMU och odometri kan ersättas med fakes i tester.
 - HSV-vision bevarar buds, leaves, turn-marker, zoner, target och maskdata.
+- Fyra oberoende rader stöds: Cam 1 hanterar rad 1–2, Cam 2 rad 3–4.
+  Högsta aktiva radnummer med giltigt visuellt mål blir master. En aktiv Cam 2
+  som saknar färska frames stoppar AUTO med `CAMERA_2_TIMEOUT`; äldre
+  enkameraprofiler får därför rad 3–4 avstängda tills operatören aktiverar dem.
 - Heading filtreras cirkulärt och använder OAK-D:s fabrikskalibrering.
 - En sammanhängande observation matas till den explicita state machine:n.
 - Diagnostics-API, dashboard och senaste-bildströmmar finns.
@@ -26,9 +31,11 @@ Fysisk motoroutput är avsiktligt avstängd. Standardgränsen är
 ## Arkitektur
 
 ```text
-OAK-D SR
-  +-- CAM_B frame queue -- latest camera value -- vision --+
-  +-- BNO086 IMU queue --- latest IMU value ---- heading -+--> observation
+Cam 1: OAK-D SR
+  +-- CAM_B frame queue -- latest camera value -- vision rad 1–2 --+
+  +-- BNO086 IMU queue --- latest IMU value ---- heading ----------+--> observation
+Cam 2: OAK-D SR
+  +-- CAM_B frame queue -- latest camera value -- vision rad 3–4 --+
   +-- encoder backend ---- latest distance ------ odometry-+       |
 																  v
 															state machine
@@ -439,19 +446,19 @@ API och streams:
 - `POST /api/auto` - välj AUTO utan att starta körning.
 - `POST /api/start-auto` - begär AUTO-start om färska data och target finns.
 - `POST /api/stop` - omedelbart STOP.
-- `GET /stream/raw` - originalbild.
-- `GET /stream/overlay` - bild med zoner och target-overlay.
-- `GET /stream/buds` - buds-mask.
-- `GET /stream/leaves` - leaves-mask.
-- `GET /stream/marker` - turn-marker-mask.
-- `GET /snapshot/{raw,overlay,buds,leaves,marker}` - en cachefri aktuell
-  JPEG-bild per anrop.
+- `GET /stream/raw`, `/stream/buds`, `/stream/leaves` och `/stream/marker` -
+  Cam 1:s original- respektive maskbilder.
+- `GET /stream/cam2-raw`, `/stream/cam2-buds` och `/stream/cam2-leaves` -
+  motsvarande Cam 2-bilder.
+- `GET /snapshot/{raw,buds,leaves,marker,cam2-raw,cam2-buds,cam2-leaves}` -
+  en cachefri aktuell JPEG-bild per anrop.
 
 Dashboarden är ett diagnostics- och operatörsgränssnitt. Den armerar inte
 motorer och kan inte kringgå lease eller motorboundary.
 
-Dashboardens fyra live-vyer använder `snapshot`-vägen med 10 Hz polling och
-högst en pågående hämtning per vy. Det undviker att långlivade MJPEG-svar
+Dashboardens Cam 1- och Cam 2-original samt deras buds-/leaves-masker använder
+`snapshot`-vägen med 10 Hz polling och högst en pågående hämtning per vy. Det
+undviker att långlivade MJPEG-svar
 buffras i VS Code:s SSH-portvidarebefordran. De äldre `/stream/...`-vägarna
 finns kvar för kompatibilitet med externa MJPEG-klienter.
 
@@ -515,15 +522,20 @@ operatören uttryckligen anger ett gemensamt värde innan profilen skrivs om.
 
 ### Perspektiv, crop och zoner
 
-Visionen kan följa två rader samtidigt. Rad 1 använder de befintliga
-`x_goal`-, `navigation_zone`-, `trigger_zone`- och `pick_zone`-fälten;
-rad 2 använder respektive suffix `_2`. Rad 1 är alltid master när båda har
-ett giltigt target, annars tar rad 2 över direkt. Trigger och pick är OR över
-de två radzonerna, medan `turn_marker_zone` är gemensam. Endast knoppar (aldrig
-blast) i en triggerzon kan starta `AUTO_PICK`. Efter pick behålls samma
-masterprioritet: rad 1, sedan rad 2, och sist IMU-only-sökning. Den gemensamma
-`post_pick_lockout_distance_m` spärrar återtrigger från båda zonerna. Varje rad har egen
-targethistorik och sitt eget perspektivprojicerade x-goal.
+Visionen kan följa fyra rader samtidigt. Cam 1 hanterar rad 1–2 och använder
+den enda IMU-källan; Cam 2 hanterar rad 3–4. Konfigurationsfältet
+`cam_1_serial_number` respektive `cam_2_serial_number` binder varje pipeline
+till rätt fysisk kamera. Varje rad har `enabled`, eget x-goal och egna
+navigation-, pick- och triggergränser. Högsta aktiva radnummer med ett giltigt
+visuellt mål blir master (`4 → 3 → 2 → 1`); saknas mål i alla aktiva rader
+används IMU-only-navigering från Cam 1.
+
+Endast knoppar (aldrig blast) i en aktiv rads triggerzon kan starta
+`AUTO_PICK`. Trigger och pick beaktas för samtliga aktiva rader, medan
+`turn_marker_zone` är gemensam. Den gemensamma
+`post_pick_lockout_distance_m` spärrar återtrigger från alla rader. Varje rad
+har egen targethistorik och sitt eget perspektivprojicerade x-goal. Originalbilden
+visar färgförklaringar och guider endast för en kamera som har minst en aktiv rad.
 
 `vision.first_crop` är en normaliserad första beskärning (`x_min`, `x_max`,
 `y_min`, `y_max`). Den utförs före HSV-filtrering, zonmaskning, detektion och
@@ -585,6 +597,12 @@ får dem; JSON-filer och intern runtime behåller motor-side RPM. Rutan under
 driftlägesknapparna visar direkt `navigation_mode` (buds only/buds + leaves),
 `search_length_m` (max IMU-only navigation), `max_pick_wait_s`, in-row-turn,
 new-row-riktning och antal rader.
+
+I **Radmål och zoner** har varje rad ett eget kort. Fälten är namngivna per rad,
+till exempel `x_distance_row_3`, `y_min_row_3` och `y_max_row_3`, under
+`navigation_boundaries_row_3`, `pick_boundaries_row_3` och
+`trigger_boundaries_row_3`. Det gör det möjligt att justera en rad utan att
+tolka interna suffix i sparade profilfält.
 
 **Reload/restart from configuration** sparar först den visade kandidaten som
 vald profil och gör sedan en kontrollerad processomstart. Knappen kräver

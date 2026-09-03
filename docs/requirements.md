@@ -1258,9 +1258,9 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | `vision_kp`                   | P-faktor för bildbaserad styrning. Avgör hur kraftigt motorhastigheterna korrigeras utifrån `x_error`.                               |
 | `vision_deadband_px`          | Om absolutvärdet av `x_error` är mindre än detta antal pixlar görs ingen styrkorrigering.                                            |
 | `max_vision_correction_rpm`   | Maximalt tillåten differentialkorrektion i rpm från den visuella regulatorn.                                                         |
-| `x_goal` / `x_goal_2`         | x-positionerna för rad 1 respektive rad 2 i den processade bilden. Rad 1 är master när båda har giltigt mål; annars används rad 2. |
-| `row_1_enabled` / `row_2_enabled` | Anger om respektive rad får leverera visuellt navigationsmål. Båda är aktiva som standard; en inaktiverad rad kan inte väljas som master. |
-| `camera_serial_number` | Serienummer för kameran som hanterar rad 1 och 2. Sparas i konfigurationen för kommande fler-kamerastöd, men ändrar inte nuvarande kameraurval. |
+| `x_goal` … `x_goal_4`         | x-positionerna för rad 1–4 i respektive kameras processade bild. Högsta aktiva radnummer med giltigt mål väljs deterministiskt som master. |
+| `row_1_enabled` … `row_4_enabled` | Anger om respektive rad får leverera visuellt navigationsmål och trigger/pick-händelser. En inaktiverad rad kan inte väljas som master. |
+| `cam_1_serial_number` / `cam_2_serial_number` | Cam 1 hanterar rad 1–2 och är den enda tillåtna IMU-källan. Cam 2 hanterar rad 3–4 och är video-only. Äldre `camera_serial_number` migreras till `cam_1_serial_number`. |
 | `x_filter_window_frames`      | Antal giltiga bildmätningar per rad som används för tidsmässigt glidande medelvärde av dess `target_x`; historiker får inte delas. |
 | `x_outlier_threshold_px`      | Gräns för hur kraftigt en ny x-mätning får avvika innan den eventuellt ignoreras som outlier. Funktionen kan initialt vara avstängd. |
 | `navigation_lost_timeout_s`   | Hur länge giltiga visuella navigationsmål får saknas innan systemet går till `AUTO_SEARCH`.                                          |
@@ -1355,13 +1355,13 @@ Det är inte nödvändigt att alla hårdvaru- och säkerhetsparametrar är ändr
 | `marker_hsv_high` | Övre HSV-gräns för detektion av vändmarkören.  |
 | `marker_min_area` | Minsta accepterade bildarea för en vändmarkör. |
 
-## 41.11 `navigation_zone` och `navigation_zone_2`
+## 41.11 `navigation_zone` till `navigation_zone_4`
 
 Zonen bör helst anges med normaliserade koordinater mellan `0.0` och `1.0`.
-`navigation_zone` tillhör rad 1 och `navigation_zone_2` rad 2. Varje zon
-genererar sitt eget visuella mål; rad 1 väljs deterministiskt när båda är
-giltiga, annars väljs rad 2. Om inget mål finns gäller den vanliga IMU-only
-fallbacken.
+`navigation_zone` tillhör rad 1 och suffix `_2`, `_3`, `_4` tillhör respektive
+rad. Rad 1–2 använder Cam 1 och rad 3–4 Cam 2. Varje zon genererar sitt eget
+visuella mål; högsta aktiva radnummer med giltigt mål väljs deterministiskt.
+Om inget mål finns gäller den vanliga IMU-only-fallbacken från Cam 1.
 
 | Parameter               | Förklaring                                                       |
 | ----------------------- | ---------------------------------------------------------------- |
@@ -1370,10 +1370,10 @@ fallbacken.
 | `navigation_zone.y_min` | Övre gräns för området som används för visuell radnavigation.    |
 | `navigation_zone.y_max` | Nedre gräns för området som används för visuell radnavigation.   |
 
-## 41.12 `trigger_zone` och `trigger_zone_2`
+## 41.12 `trigger_zone` till `trigger_zone_4`
 
-Det finns en triggerzon per rad. En knopp i **endera** zonen ska aktivera
-triggern; det finns ingen delad triggerzon.
+Det finns en triggerzon per rad. En knopp i en aktiv zon ska aktivera
+triggern; det finns ingen delad triggerzon. Blast får aldrig aktivera triggern.
 
 | Parameter            | Förklaring                                                         |
 | -------------------- | ------------------------------------------------------------------ |
@@ -1382,9 +1382,9 @@ triggern; det finns ingen delad triggerzon.
 | `trigger_zone.y_min` | Övre gräns för triggerområdet.                                     |
 | `trigger_zone.y_max` | Nedre gräns för triggerområdet.                                    |
 
-## 41.13 `pick_zone` och `pick_zone_2`
+## 41.13 `pick_zone` till `pick_zone_4`
 
-Det finns en pickzon per rad. En knopp i **endera** zonen räknas som knopp i
+Det finns en pickzon per rad. En knopp i en aktiv zon räknas som knopp i
 pickområdet under `AUTO_PICK`.
 
 | Parameter         | Förklaring                                                 |

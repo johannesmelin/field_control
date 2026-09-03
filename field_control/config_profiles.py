@@ -83,7 +83,9 @@ def operator_profile_dict(config: RuntimeConfig) -> dict[str, Any]:
 
 
 _ZONE_FIELDS = frozenset({"navigation_zone", "trigger_zone", "pick_zone", "turn_marker_zone",
-                          "navigation_zone_2", "trigger_zone_2", "pick_zone_2"})
+                          "navigation_zone_2", "trigger_zone_2", "pick_zone_2",
+                          "navigation_zone_3", "trigger_zone_3", "pick_zone_3",
+                          "navigation_zone_4", "trigger_zone_4", "pick_zone_4"})
 
 
 def _merge(base: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:

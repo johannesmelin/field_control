@@ -126,3 +126,32 @@ class ConfigProfileTests(unittest.TestCase):
                                                       "unexpected": 1}
             (directory / name).write_text(json.dumps(profile))
             with self.assertRaises(ValueError): load_profile(name, RuntimeConfig(), directory)
+
+    def test_row_three_and_four_zone_profiles_replace_discriminated_shapes_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); name = "konfig_20260903_120000.json"
+            profile = operator_profile_dict(RuntimeConfig())
+            # Deployment defaults are goal-relative. A recursive merge here
+            # would fabricate an invalid x_distance/x_min hybrid instead of
+            # accepting this deliberate legacy rectangle replacement.
+            profile["vision"]["navigation_zone_3"] = {"x_min": .1, "x_max": .4,
+                                                        "y_min": .3, "y_max": 1.0}
+            profile["vision"]["navigation_zone_4"] = {"x_min": .6, "x_max": .9,
+                                                        "y_min": .3, "y_max": 1.0}
+            (directory / name).write_text(json.dumps(profile))
+            loaded = load_profile(name, RuntimeConfig(), directory)
+        self.assertEqual(loaded.vision.navigation_zone_3, Zone(.1, .4, .3, 1.0))
+        self.assertEqual(loaded.vision.navigation_zone_4, Zone(.6, .9, .3, 1.0))
+
+    def test_merged_legacy_cam_one_serial_normalizes_empty_new_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp); name = "konfig_20260903_120001.json"
+            profile = operator_profile_dict(RuntimeConfig())
+            profile["vision"]["camera_serial_number"] = "19443010813DFC5A00"
+            # This is what a merge against a modern deployment contributes
+            # when the historical profile could not contain the new key.
+            profile["vision"]["cam_1_serial_number"] = ""
+            (directory / name).write_text(json.dumps(profile))
+            loaded = load_profile(name, RuntimeConfig(), directory)
+        self.assertEqual(loaded.vision.cam_1_serial_number, "19443010813DFC5A00")
+        self.assertEqual(loaded.vision.camera_serial_for(1), "19443010813DFC5A00")

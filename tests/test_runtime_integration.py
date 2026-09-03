@@ -3,6 +3,7 @@ import threading
 import time
 import io
 from dataclasses import replace
+from types import SimpleNamespace
 
 from field_control.config import PhysicalCanConfig, RuntimeConfig, VisionConfig
 from field_control.control import WheelCommand
@@ -22,6 +23,74 @@ from unittest.mock import patch
 
 
 class RuntimeIntegrationTests(unittest.TestCase):
+    def test_enabled_cam_two_timeout_blocks_auto_and_dispatches_no_nonzero_command(self):
+        class PassiveSource:
+            def __init__(self): self.latest = LatestValue()
+            def start(self): pass
+            def stop(self): pass
+
+        class Motor:
+            armed = False
+            def __init__(self): self.commands = []; self.stops = []
+            def stop_all(self, reason): self.stops.append(reason)
+            def command(self, command, _token): self.commands.append(command)
+
+        motor = Motor()
+        runtime = FieldControlRuntime(RuntimeConfig(stream_enabled=False,
+                                                    vision=VisionConfig(row_3_enabled=True)),
+                                      PassiveSource(), PassiveSource(), motor=motor)
+        runtime._lifecycle = _Lifecycle.RUNNING
+        # This is the exact observation published by the bounded CAM2
+        # freshness gate while rows 3/4 are enabled by default.
+        runtime._observation = SimpleNamespace(fault="CAMERA_2_TIMEOUT")
+        with self.assertRaisesRegex(ValueError, "CAMERA_2_TIMEOUT"):
+            runtime.start_auto()
+        self.assertEqual(motor.commands, [])
+        self.assertFalse(runtime._auto_selected)
+
+    def test_cam_two_timeout_is_not_required_when_rows_three_and_four_disabled(self):
+        cfg = RuntimeConfig(stream_enabled=False,
+                            vision=VisionConfig(row_3_enabled=False, row_4_enabled=False))
+        self.assertFalse(cfg.vision.row_3_enabled or cfg.vision.row_4_enabled)
+
+    def test_two_camera_vision_uses_highest_active_row_as_global_master(self):
+        from field_control.vision import VisionResult
+        import numpy as np
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        def result(rows, target_row):
+            targets = {row: ((float(row), 1.0) if row == target_row else (None, None)) for row in rows}
+            return VisionResult(timestamp_s=1.0, target_x=targets[target_row][0], target_y=1.0,
+                                bud_in_trigger_zone=False, bud_in_pick_zone=False, marker_found=False,
+                                masks={}, overlay=blank, raw_frame=blank, master_row=target_row,
+                                row_1_target_x=targets.get(1, (None, None))[0], row_1_target_y=targets.get(1, (None, None))[1],
+                                row_2_target_x=targets.get(2, (None, None))[0], row_2_target_y=targets.get(2, (None, None))[1],
+                                row_3_target_x=targets.get(3, (None, None))[0], row_3_target_y=targets.get(3, (None, None))[1],
+                                row_4_target_x=targets.get(4, (None, None))[0], row_4_target_y=targets.get(4, (None, None))[1],
+                                row_targets=targets, row_triggered={row: False for row in rows},
+                                row_picking={row: False for row in rows})
+        merged = FieldControlRuntime._combine_camera_vision(result((1, 2), 2), result((3, 4), 4))
+        self.assertEqual(merged.master_row, 4)
+        self.assertEqual(merged.target_x, 4.0)
+
+    def test_empty_cam_two_never_erases_valid_cam_one_target(self):
+        from field_control.vision import VisionResult
+        import numpy as np
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        cam_one = VisionResult(timestamp_s=1.0, target_x=1.0, target_y=1.0,
+                               bud_in_trigger_zone=False, bud_in_pick_zone=False, marker_found=False,
+                               masks={}, overlay=blank, raw_frame=blank, master_row=1,
+                               row_1_target_x=1.0, row_1_target_y=1.0,
+                               row_targets={1: (1.0, 1.0), 2: (None, None)},
+                               row_triggered={1: False, 2: False}, row_picking={1: False, 2: False})
+        cam_two_empty = VisionResult(timestamp_s=1.0, target_x=None, target_y=None,
+                                     bud_in_trigger_zone=False, bud_in_pick_zone=False, marker_found=False,
+                                     masks={}, overlay=blank, raw_frame=blank, master_row=None,
+                                     row_targets={1: (None, None), 2: (None, None),
+                                                  3: (None, None), 4: (None, None)},
+                                     row_triggered={}, row_picking={})
+        merged = FieldControlRuntime._combine_camera_vision(cam_one, cam_two_empty)
+        self.assertEqual(merged.master_row, 1)
+        self.assertEqual(merged.target_x, 1.0)
     @staticmethod
     def _physical_config(*, odometry_timeout_s=.2):
         return RuntimeConfig(
