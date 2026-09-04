@@ -40,7 +40,7 @@ Implement against that specification.
 
 If the specification is later stored in a repository document such as:
 
-`docs/requirements.md`
+`requirements/requirements.md`
 
 that repository document becomes the preferred authoritative reference.
 
@@ -1205,4 +1205,3 @@ When deciding whether to return control to the user, ask:
 If useful unblocked work remains:
 
 **DO THE WORK. DO NOT STOP TO ASK FOR PERMISSION TO CONTINUE.**
-

@@ -57,19 +57,19 @@ Viktiga principer:
 
 | Fil | Ansvar |
 | --- | --- |
-| `field_control/app.py` | Top-level lifecycle för runtime och webserver |
-| `field_control/sources.py` | OAK-D-, IMU-, encoder- och latest-value-källor |
-| `field_control/observation.py` | Headingprocessor och samlad observation |
-| `field_control/vision.py` | HSV-detektion, zoner, target och maskbilder |
-| `field_control/heading.py` | Cirkulär filtrering och row-heading-reference |
-| `field_control/odometry.py` | 8:1 motor-/hjulgeometri, motor↔hjul-RPM och dödräkning |
-| `field_control/turn.py` | Ren turn-geometri utan hårdvaruåtkomst |
-| `field_control/state_machine.py` | Explicit navigation och fail-closed states |
-| `field_control/control.py` | Begränsade vision- och headingkommandon |
-| `field_control/motor_boundary.py` | Disabled/lease-gated fysisk outputgräns |
-| `field_control/lease.py` | Monoton control lease och watchdog |
-| `field_control/diagnostics.py` | JSON-safe statusmodell |
-| `field_control/web.py` | Dashboard, status-API och MJPEG streams |
+| `src/field_control/app.py` | Top-level lifecycle för runtime och webserver |
+| `src/field_control/sources.py` | OAK-D-, IMU-, encoder- och latest-value-källor |
+| `src/field_control/observation.py` | Headingprocessor och samlad observation |
+| `src/field_control/vision.py` | HSV-detektion, zoner, target och maskbilder |
+| `src/field_control/heading.py` | Cirkulär filtrering och row-heading-reference |
+| `src/field_control/odometry.py` | 8:1 motor-/hjulgeometri, motor↔hjul-RPM och dödräkning |
+| `src/field_control/turn.py` | Ren turn-geometri utan hårdvaruåtkomst |
+| `src/field_control/state_machine.py` | Explicit navigation och fail-closed states |
+| `src/field_control/control.py` | Begränsade vision- och headingkommandon |
+| `src/field_control/motor_boundary.py` | Disabled/lease-gated fysisk outputgräns |
+| `src/field_control/lease.py` | Monoton control lease och watchdog |
+| `src/field_control/diagnostics.py` | JSON-safe statusmodell |
+| `src/field_control/web.py` | Dashboard, status-API och MJPEG streams |
 
 ## Installation
 
@@ -497,7 +497,7 @@ Den fysiska OAK-D/BNO086-kommunikationen har verifierats med:
 
 ## Konfiguration
 
-Konfigurationstyperna finns i `field_control/config.py`. Viktiga värden är:
+Konfigurationstyperna finns i `src/field_control/config.py`. Viktiga värden är:
 
 - `processing_width` / `processing_height`: standard `320x200` (16:10);
 - `stream_width` / `stream_height`: standard `320x200` (16:10);
@@ -740,7 +740,9 @@ dashboard eller diagnostics.
 
 ## Relaterad dokumentation
 
-- [Kravspecifikation](docs/requirements.md)
-- [Arkitektur](docs/architecture.md)
+- [Kravspecifikation](requirements/requirements.md)
+- [Arkitektur](requirements/architecture.md)
+- [Säkerhetsram](requirements/safety.md)
+- [Dokumentationsreferenser](docs/README.md)
 - [Återanvändningsinventering](docs/reuse_inventory.md)
-- [Agentinstruktioner](agent.md)
+- [Agentinstruktioner](AGENTS.md)

@@ -12,9 +12,28 @@ from field_control.config import GoalRelativeZone, PhysicalCanConfig, RuntimeCon
 from field_control.config_profiles import (list_profiles, load_selected_or_latest,
                                            load_profile, operator_profile_dict, save_profile,
                                            select_profile)
+from field_control.config_profiles import default_profiles_dir
 
 
 class ConfigProfileTests(unittest.TestCase):
+    def test_default_profiles_dir_is_at_source_tree_root(self):
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(default_profiles_dir(), project_root / "konfigurationer")
+
+    def test_selected_profile_takes_precedence_over_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            deployment = RuntimeConfig()
+            selected = save_profile(replace(deployment, manual_rpm=2), directory,
+                                    now=datetime(2026, 1, 1, 1, 1, 1))
+            save_profile(replace(deployment, manual_rpm=3), directory,
+                         now=datetime(2026, 1, 1, 1, 1, 2))
+            select_profile(selected, directory)
+
+            config, name = load_selected_or_latest(deployment, directory)
+
+        self.assertEqual((name, config.manual_rpm), (selected, 2))
+
     def test_save_is_private_and_never_contains_physical_can(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "konfigurationer"

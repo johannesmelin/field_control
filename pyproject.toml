@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "field-control"
 version = "0.1.0"
@@ -7,6 +11,12 @@ dependencies = [
 	"numpy>=1.24",
 	"opencv-python-headless>=4.8",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.scripts]
 field-control = "field_control.cli:main"

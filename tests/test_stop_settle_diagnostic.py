@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from field_control.stop_settle_diagnostic import (
+    DIAGNOSTICS_DIRECTORY,
     StopSettleDiagnosticRequest,
     run_stop_settle_diagnostic,
 )
@@ -39,6 +40,10 @@ class Boundary:
 
 
 class StopSettleDiagnosticTests(unittest.TestCase):
+    def test_default_diagnostics_directory_is_at_source_tree_root(self):
+        project_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(DIAGNOSTICS_DIRECTORY, project_root / "diagnostics")
+
     def request(self, **changes):
         values = dict(slcan_device="/dev/serial/by-id/usb-CANable_test", enable_can=True,
                       confirm_physical_stop_tested=True, confirm_wheels_raised=True, sample_count=3)

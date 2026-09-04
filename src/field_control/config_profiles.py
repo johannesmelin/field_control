@@ -17,6 +17,7 @@ from typing import Any
 
 from .config import RuntimeConfig
 from .config_io import runtime_config_from_dict
+from .project_paths import project_data_root
 
 _NAME = re.compile(r"konfig_\d{8}_\d{6}(?:_\d{6})?\.json\Z")
 _SELECTED = "selected.json"
@@ -27,7 +28,7 @@ _DEPLOYMENT_ONLY = frozenset({"physical_can", "control_lease_timeout_s", "watchd
 
 
 def default_profiles_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "konfigurationer"
+    return project_data_root() / "konfigurationer"
 
 
 def _directory(directory: Path) -> Path:

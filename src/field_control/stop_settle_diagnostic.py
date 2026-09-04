@@ -20,6 +20,7 @@ import time
 from typing import Any, Iterable
 
 from .lease import ControlLease
+from .project_paths import project_data_root
 from .verified_motor_boundary import open_verified_boundary
 
 
@@ -27,7 +28,7 @@ DEFAULT_CAN_CHANNEL = "can0"
 DEFAULT_SAMPLE_COUNT = 10
 MAX_SAMPLE_COUNT = 30
 SAMPLE_PERIOD_S = 0.100
-DIAGNOSTICS_DIRECTORY = Path(__file__).resolve().parents[1] / "diagnostics"
+DIAGNOSTICS_DIRECTORY = project_data_root() / "diagnostics"
 REPORT_CREATE_ATTEMPTS = 8
 _STATUS_SAMPLE_RE = re.compile(r"0x9C sample (-?\d+) dps after ([0-9.]+) ms")
 
